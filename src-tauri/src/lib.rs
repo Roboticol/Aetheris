@@ -1075,9 +1075,9 @@ async fn run_gemini_agent(
     };
 
     let system_prompt = if is_plan_mode {
-        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Output a clear technical summary followed by numbered concrete steps citing exact file paths and symbols."
+        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block."
     } else {
-        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. After staging all edits, conclude with a concise summary and ordered verification steps."
+        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets)."
     };
 
     let mut contents: Vec<serde_json::Value> = history
@@ -1664,38 +1664,6 @@ async fn run_gemini_agent(
         None => started_at.elapsed().as_millis() as u64,
     };
 
-    let parsed_steps: Vec<String> = final_answer_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| {
-            let mut chars = l.chars();
-            let mut has_digit = false;
-            while let Some(c) = chars.next() {
-                if c.is_ascii_digit() {
-                    has_digit = true;
-                } else {
-                    return has_digit && c == '.' && chars.next() == Some(' ');
-                }
-            }
-            false
-        })
-        .filter_map(|l| l.split_once(". ").map(|(_, rest)| rest.trim().to_string()))
-        .take(12)
-        .collect();
-
-    let mut final_steps = parsed_steps;
-    if final_steps.is_empty() {
-        let mut seen_steps: HashSet<String> = HashSet::new();
-        for s in step_trace {
-            if seen_steps.insert(s.clone()) {
-                final_steps.push(s);
-                if final_steps.len() >= 12 {
-                    break;
-                }
-            }
-        }
-    }
-
     emit_agent_activity(
         &app,
         "phase-think",
@@ -1731,7 +1699,7 @@ async fn run_gemini_agent(
 
     Ok(AgentPlanResponse {
         summary,
-        steps: final_steps,
+        steps: Vec::new(),
         patches,
         thoughts: thoughts_accum.trim().to_string(),
         thinking_duration_ms,

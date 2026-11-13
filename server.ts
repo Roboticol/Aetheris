@@ -920,7 +920,7 @@ async function startServer() {
   app.post('/api/agent/plan', async (req, res) => {
     const abortController = new AbortController();
     let clientClosed = false;
-    req.on('close', () => {
+    res.on('close', () => {
       if (!res.writableEnded) {
         clientClosed = true;
         abortController.abort();
@@ -1467,8 +1467,8 @@ async function startServer() {
         effort === 'xhigh' ? 24 : effort === 'high' ? 18 : effort === 'low' ? 8 : 14;
 
       const systemInstruction = isPlanMode
-        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Output a clear technical summary followed by numbered concrete steps citing exact file paths and symbols.'
-        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. After staging all edits, conclude with a concise summary and ordered verification steps.';
+        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.'
+        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).';
 
       const priorTurns: Content[] = (history ?? [])
         .filter((h) => h.content && h.content.trim())
@@ -1599,15 +1599,6 @@ async function startServer() {
           ? Math.max(200, (thoughtEndMs ?? Date.now()) - thoughtStartMs)
           : Date.now() - startedAt;
 
-      const parsedSteps = finalAnswerText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => /^\d+\.\s+/.test(line))
-        .map((line) => line.replace(/^\d+\.\s+/, ''))
-        .slice(0, 12);
-
-      const finalSteps = parsedSteps.length > 0 ? parsedSteps : Array.from(new Set(stepTrace)).slice(0, 12);
-
       emitEvent({
         type: 'activity',
         activity: {
@@ -1636,7 +1627,7 @@ async function startServer() {
           (patches.length > 0
             ? `Prepared ${patches.length} file change(s) for review.`
             : 'Completed workspace analysis.'),
-        steps: finalSteps,
+        steps: [],
         patches,
         thoughts: thoughtsAccum.trim(),
         thinkingDurationMs,

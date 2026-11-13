@@ -25,6 +25,7 @@ import {
   ModelEffort,
 } from '../types/ide';
 import { Tooltip } from './Tooltip';
+import { MarkdownContent } from './MarkdownContent';
 
 interface AgentPanelProps {
   width: number;
@@ -116,8 +117,11 @@ const ThoughtAccordion: React.FC<{
       </button>
 
       {expanded && (
-        <div className="max-h-48 overflow-y-auto border-t border-[#272B38]/80 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-[#9CA3B8] whitespace-pre-wrap">
-          {thoughts}
+        <div className="max-h-48 overflow-y-auto border-t border-[#272B38]/80 px-2.5 py-2">
+          <MarkdownContent
+            content={thoughts}
+            className="text-[11.5px] leading-relaxed text-[#9CA3B8]"
+          />
         </div>
       )}
     </div>
@@ -375,15 +379,15 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     {msg.content || 'Prompt cancelled by user.'}
                   </div>
                 ) : msg.content ? (
-                  <div
-                    className={`rounded-md p-2.5 text-[12.5px] leading-relaxed whitespace-pre-wrap ${
-                      msg.role === 'user'
-                        ? 'bg-[#1E222E] text-[#E6E8EE]'
-                        : 'border border-[#272B38] bg-[#0F1117] text-[#D1D5E0]'
-                    }`}
-                  >
-                    {msg.content}
-                  </div>
+                  msg.role === 'user' ? (
+                    <div className="rounded-md bg-[#1E222E] px-3 py-2 text-[12.5px] leading-relaxed text-[#E6E8EE] whitespace-pre-wrap">
+                      {msg.content}
+                    </div>
+                  ) : (
+                    <div className="px-0.5 py-0.5">
+                      <MarkdownContent content={msg.content} onOpenFile={onOpenFile} />
+                    </div>
+                  )
                 ) : msg.isStreaming ? (
                   <div className="flex items-center gap-2 rounded-md border border-[#272B38] bg-[#0F1117] px-3 py-2 text-[12px] text-[#8B92A5]">
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-[#818CF8]" />
@@ -394,19 +398,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     </span>
                   </div>
                 ) : null}
-
-                {msg.steps && msg.steps.length > 0 && (
-                  <ul className="space-y-1 pl-1 text-[11.5px] text-[#8B92A5]">
-                    {msg.steps.map((step, i) => (
-                      <li key={i} className="flex items-start gap-1.5">
-                        <span className="font-mono text-[#6366F1] tabular-nums">
-                          {i + 1}.
-                        </span>
-                        <span>{step}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
 
                 {msg.role === 'assistant' &&
                   msg.mode === 'plan' &&
@@ -423,10 +414,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                           const stepsText = (msg.steps ?? [])
                             .map((s, idx) => `${idx + 1}. ${s}`)
                             .join('\n');
-                          void onSendPrompt(
-                            `Implement the following approved plan across the workspace:\n\n${msg.content}\n\nSteps:\n${stepsText}`,
-                            'action'
-                          );
+                          const planPrompt = stepsText
+                            ? `Implement the following approved plan across the workspace:\n\n${msg.content}\n\nSteps:\n${stepsText}`
+                            : `Implement the following approved plan across the workspace:\n\n${msg.content}`;
+                          void onSendPrompt(planPrompt, 'action');
                         }}
                         className="flex items-center gap-1.5 rounded-md bg-[#6366F1] px-2.5 py-1.5 text-[11.5px] font-medium text-white hover:bg-[#818CF8] disabled:opacity-40 transition-colors"
                       >
