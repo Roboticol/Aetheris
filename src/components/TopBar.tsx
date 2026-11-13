@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   ChevronDown,
   FolderOpen,
-  Home,
   PanelBottom,
   PanelLeft,
   PanelRight,
@@ -68,17 +67,6 @@ export const TopBar: React.FC<TopBarProps> = ({
             <span className="text-[15px] font-bold leading-[20px] tracking-tight">
               Aetheris
             </span>
-          </button>
-        </Tooltip>
-
-        <Tooltip label="Return to Home Screen">
-          <button
-            type="button"
-            onClick={onGoHome}
-            aria-label="Home Screen"
-            className="rounded-md p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors shrink-0"
-          >
-            <Home className="h-3.5 w-3.5" />
           </button>
         </Tooltip>
 

@@ -787,6 +787,683 @@ async fn run_gemini_agent(
     })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileEntry {
+    pub path: String,
+    pub status: String,
+    pub staged: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitInfo {
+    pub hash: String,
+    pub short_hash: String,
+    pub message: String,
+    pub author: String,
+    pub relative_time: String,
+    pub pushed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusSnapshot {
+    pub is_repo: bool,
+    pub branch: String,
+    pub branches: Vec<String>,
+    pub remote_url: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub has_upstream: bool,
+    pub staged: Vec<GitFileEntry>,
+    pub changes: Vec<GitFileEntry>,
+    pub unpushed_files: Vec<String>,
+    pub pushed_files: Vec<String>,
+    pub commits: Vec<GitCommitInfo>,
+    pub user_name: Option<String>,
+    pub user_email: Option<String>,
+    pub gh_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffPreview {
+    pub path: String,
+    pub status: String,
+    pub staged: bool,
+    pub original_content: String,
+    pub modified_content: String,
+}
+
+fn run_git_cmd(root: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output();
+
+    match out {
+        Ok(o) => (
+            o.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ),
+        Err(e) => (1, String::new(), e.to_string()),
+    }
+}
+
+fn map_git_code(ch: char) -> &'static str {
+    match ch {
+        'A' => "A",
+        'D' => "D",
+        'R' => "R",
+        'U' => "C",
+        '?' => "U",
+        _ => "M",
+    }
+}
+
+fn collect_git_status(root: &Path) -> GitStatusSnapshot {
+    let (code, inside_out, _) = run_git_cmd(root, &["rev-parse", "--is-inside-work-tree"]);
+    let gh_available = Command::new("gh").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+    let (_, u_name_raw, _) = run_git_cmd(root, &["config", "user.name"]);
+    let (_, u_email_raw, _) = run_git_cmd(root, &["config", "user.email"]);
+    let user_name = Some(u_name_raw.trim().to_string()).filter(|s| !s.is_empty());
+    let user_email = Some(u_email_raw.trim().to_string()).filter(|s| !s.is_empty());
+
+    if code != 0 || inside_out.trim() != "true" {
+        return GitStatusSnapshot {
+            is_repo: false,
+            branch: String::new(),
+            branches: Vec::new(),
+            remote_url: None,
+            ahead: 0,
+            behind: 0,
+            has_upstream: false,
+            staged: Vec::new(),
+            changes: Vec::new(),
+            unpushed_files: Vec::new(),
+            pushed_files: Vec::new(),
+            commits: Vec::new(),
+            user_name,
+            user_email,
+            gh_available,
+        };
+    }
+
+    let (_, status_out, _) = run_git_cmd(root, &["status", "--porcelain=v1", "-b", "-uall"]);
+    let mut branch = String::from("main");
+    let mut staged: Vec<GitFileEntry> = Vec::new();
+    let mut changes: Vec<GitFileEntry> = Vec::new();
+
+    for line in status_out.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix("## ") {
+            let trimmed = header.trim();
+            if let Some(rest) = trimmed.strip_prefix("No commits yet on ") {
+                branch = rest.trim().to_string();
+            } else if let Some((left, _)) = trimmed.split_once("...") {
+                branch = left.trim().to_string();
+            } else if let Some((left, _)) = trimmed.split_once(' ') {
+                branch = left.trim().to_string();
+            } else {
+                branch = trimmed.to_string();
+            }
+            continue;
+        }
+
+        if line.len() < 4 {
+            continue;
+        }
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        let mut file_path = line[3..].trim().to_string();
+        if let Some((_, right)) = file_path.split_once(" -> ") {
+            file_path = right.trim().to_string();
+        }
+        if file_path.starts_with('"') && file_path.ends_with('"') && file_path.len() >= 2 {
+            file_path = file_path[1..file_path.len() - 1].to_string();
+        }
+
+        if x == '?' && y == '?' {
+            changes.push(GitFileEntry {
+                path: file_path,
+                status: "U".into(),
+                staged: false,
+            });
+            continue;
+        }
+
+        if x != ' ' {
+            staged.push(GitFileEntry {
+                path: file_path.clone(),
+                status: map_git_code(x).into(),
+                staged: true,
+            });
+        }
+        if y != ' ' {
+            changes.push(GitFileEntry {
+                path: file_path,
+                status: map_git_code(y).into(),
+                staged: false,
+            });
+        }
+    }
+
+    let (_, branch_out, _) = run_git_cmd(root, &["branch", "--format=%(refname:short)"]);
+    let mut branches: Vec<String> = branch_out
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !branch.is_empty() && !branches.contains(&branch) {
+        branches.insert(0, branch.clone());
+    }
+
+    let (r_code, r_out, _) = run_git_cmd(root, &["remote", "get-url", "origin"]);
+    let remote_url = if r_code == 0 {
+        Some(r_out.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    let (u_code, u_out, _) = run_git_cmd(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let mut upstream_ref = if u_code == 0 {
+        u_out.trim().to_string()
+    } else {
+        String::new()
+    };
+    if upstream_ref.is_empty() && !branch.is_empty() && remote_url.is_some() {
+        let candidate = format!("origin/{}", branch);
+        let (oc, _, _) = run_git_cmd(root, &["rev-parse", "--verify", &candidate]);
+        if oc == 0 {
+            upstream_ref = candidate;
+        }
+    }
+
+    let has_upstream = !upstream_ref.is_empty();
+    let mut ahead: usize = 0;
+    let mut behind: usize = 0;
+    let mut unpushed_set = std::collections::HashSet::<String>::new();
+    let mut unpushed_hashes = std::collections::HashSet::<String>::new();
+
+    if has_upstream {
+        let range_dots = format!("{}...HEAD", upstream_ref);
+        let (cc, co, _) = run_git_cmd(root, &["rev-list", "--left-right", "--count", &range_dots]);
+        if cc == 0 {
+            let parts: Vec<&str> = co.trim().split_whitespace().collect();
+            behind = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            ahead = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+
+        let range_diff = format!("{}..HEAD", upstream_ref);
+        let (dc, do_out, _) = run_git_cmd(root, &["diff", "--name-only", &range_diff]);
+        if dc == 0 {
+            for line in do_out.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                unpushed_set.insert(line.to_string());
+            }
+        }
+
+        let (rc, ro_out, _) = run_git_cmd(root, &["rev-list", &range_diff]);
+        if rc == 0 {
+            for line in ro_out.lines().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                unpushed_hashes.insert(line.to_string());
+            }
+        }
+    }
+
+    let (tc, tracked_out, _) = run_git_cmd(root, &["ls-files"]);
+    let tracked_files: Vec<String> = if tc == 0 {
+        tracked_out
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut dirty_set = std::collections::HashSet::<String>::new();
+    for s in &staged {
+        dirty_set.insert(s.path.clone());
+    }
+    for c in &changes {
+        dirty_set.insert(c.path.clone());
+    }
+
+    if !has_upstream {
+        for f in &tracked_files {
+            if !dirty_set.contains(f) {
+                unpushed_set.insert(f.clone());
+            }
+        }
+    }
+
+    let pushed_files: Vec<String> = if has_upstream {
+        tracked_files
+            .into_iter()
+            .filter(|f| !dirty_set.contains(f) && !unpushed_set.contains(f))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let (lc, log_out, _) = run_git_cmd(
+        root,
+        &["log", "-n", "15", "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ar"],
+    );
+    let commits: Vec<GitCommitInfo> = if lc == 0 {
+        log_out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|row| {
+                let cols: Vec<&str> = row.split('\x1f').collect();
+                let hash = cols.first().copied().unwrap_or("").to_string();
+                let short_hash = cols.get(1).copied().unwrap_or("").to_string();
+                let message = cols.get(2).copied().unwrap_or("").to_string();
+                let author = cols.get(3).copied().unwrap_or("").to_string();
+                let relative_time = cols.get(4).copied().unwrap_or("").to_string();
+                let pushed = has_upstream && !unpushed_hashes.contains(&hash);
+                GitCommitInfo {
+                    hash,
+                    short_hash,
+                    message,
+                    author,
+                    relative_time,
+                    pushed,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if !has_upstream && !commits.is_empty() {
+        ahead = commits.len();
+    }
+
+    GitStatusSnapshot {
+        is_repo: true,
+        branch,
+        branches,
+        remote_url,
+        ahead,
+        behind,
+        has_upstream,
+        staged,
+        changes,
+        unpushed_files: unpushed_set.into_iter().collect(),
+        pushed_files,
+        commits,
+        user_name,
+        user_email,
+        gh_available,
+    }
+}
+
+#[tauri::command]
+async fn git_status(root: String) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || collect_git_status(&root_path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn git_diff_file(
+    root: String,
+    rel_path: String,
+    staged: bool,
+    status: String,
+) -> Result<GitDiffPreview, String> {
+    let root_path = PathBuf::from(&root);
+    let target = sanitize_relative_path(&root_path, &rel_path)?;
+    tokio::task::spawn_blocking(move || {
+        let mut original_content = String::new();
+        let mut modified_content = String::new();
+
+        if staged {
+            let head_spec = format!("HEAD:{}", rel_path);
+            let (hc, ho, _) = run_git_cmd(&root_path, &["show", &head_spec]);
+            if hc == 0 {
+                original_content = ho;
+            }
+            if status != "D" {
+                let idx_spec = format!(":{}", rel_path);
+                let (ic, io, _) = run_git_cmd(&root_path, &["show", &idx_spec]);
+                if ic == 0 {
+                    modified_content = io;
+                }
+            }
+        } else {
+            if status != "U" {
+                let idx_spec = format!(":{}", rel_path);
+                let (ic, io, _) = run_git_cmd(&root_path, &["show", &idx_spec]);
+                if ic == 0 {
+                    original_content = io;
+                } else {
+                    let head_spec = format!("HEAD:{}", rel_path);
+                    let (hc, ho, _) = run_git_cmd(&root_path, &["show", &head_spec]);
+                    if hc == 0 {
+                        original_content = ho;
+                    }
+                }
+            }
+            if status != "D" {
+                modified_content = fs::read_to_string(&target).unwrap_or_default();
+            }
+        }
+
+        GitDiffPreview {
+            path: rel_path,
+            status,
+            staged,
+            original_content,
+            modified_content,
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn git_init_repo(root: String) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let (c1, _, _) = run_git_cmd(&root_path, &["init", "-b", "main"]);
+        if c1 != 0 {
+            let (c2, _, err2) = run_git_cmd(&root_path, &["init"]);
+            if c2 != 0 {
+                return Err(err2);
+            }
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_stage(root: String, paths: Vec<String>, all: bool) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let mut args: Vec<&str> = vec!["add"];
+        if all {
+            args.push("-A");
+        } else {
+            args.push("--");
+            for p in &paths {
+                args.push(p.as_str());
+            }
+        }
+        let (code, _, err) = run_git_cmd(&root_path, &args);
+        if code != 0 {
+            return Err(err);
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_unstage(root: String, paths: Vec<String>, all: bool) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let (has_head, _, _) = run_git_cmd(&root_path, &["rev-parse", "--verify", "HEAD"]);
+        let mut args: Vec<&str> = if has_head == 0 {
+            if all {
+                vec!["reset", "HEAD"]
+            } else {
+                let mut v = vec!["reset", "HEAD", "--"];
+                for p in &paths {
+                    v.push(p.as_str());
+                }
+                v
+            }
+        } else if all {
+            vec!["rm", "-r", "--cached", "."]
+        } else {
+            let mut v = vec!["rm", "--cached", "--"];
+            for p in &paths {
+                v.push(p.as_str());
+            }
+            v
+        };
+        let (code, _, err) = run_git_cmd(&root_path, &args);
+        let _ = args.len();
+        if code != 0 {
+            return Err(err);
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_discard(root: String, rel_path: String, untracked: bool) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    let target = sanitize_relative_path(&root_path, &rel_path)?;
+    tokio::task::spawn_blocking(move || {
+        if untracked {
+            if target.is_dir() {
+                fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+            } else if target.exists() {
+                fs::remove_file(&target).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let (code, _, err) = run_git_cmd(&root_path, &["checkout", "--", &rel_path]);
+            if code != 0 {
+                return Err(err);
+            }
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_commit(
+    root: String,
+    message: String,
+    stage_all_if_empty: bool,
+    user_name: Option<String>,
+    user_email: Option<String>,
+) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return Err("Commit message is required.".into());
+        }
+        if let Some(ref name) = user_name {
+            if !name.trim().is_empty() {
+                run_git_cmd(&root_path, &["config", "user.name", name.trim()]);
+            }
+        }
+        if let Some(ref email) = user_email {
+            if !email.trim().is_empty() {
+                run_git_cmd(&root_path, &["config", "user.email", email.trim()]);
+            }
+        }
+        let snap = collect_git_status(&root_path);
+        if snap.staged.is_empty() && stage_all_if_empty {
+            run_git_cmd(&root_path, &["add", "-A"]);
+        }
+        let (code, out, err) = run_git_cmd(&root_path, &["commit", "-m", trimmed]);
+        if code != 0 {
+            return Err(if err.trim().is_empty() { out } else { err });
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_branch(root: String, action: String, name: String) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Branch name is required.".into());
+        }
+        let args = if action == "create" {
+            vec!["checkout", "-b", trimmed]
+        } else {
+            vec!["checkout", trimmed]
+        };
+        let (code, _, err) = run_git_cmd(&root_path, &args);
+        if code != 0 {
+            return Err(err);
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_set_remote(root: String, url: String) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Err("Remote URL is required.".into());
+        }
+        let (exists, _, _) = run_git_cmd(&root_path, &["remote", "get-url", "origin"]);
+        let args = if exists == 0 {
+            vec!["remote", "set-url", "origin", trimmed]
+        } else {
+            vec!["remote", "add", "origin", trimmed]
+        };
+        let (code, _, err) = run_git_cmd(&root_path, &args);
+        if code != 0 {
+            return Err(err);
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_sync(root: String, action: String) -> Result<GitStatusSnapshot, String> {
+    let root_path = PathBuf::from(&root);
+    tokio::task::spawn_blocking(move || {
+        let snap = collect_git_status(&root_path);
+        if snap.remote_url.is_none() {
+            return Err("No GitHub remote \"origin\" configured yet.".into());
+        }
+        let branch = if snap.branch.is_empty() { "main".to_string() } else { snap.branch.clone() };
+        match action.as_str() {
+            "fetch" => {
+                let (c, _, e) = run_git_cmd(&root_path, &["fetch", "--all", "--prune"]);
+                if c != 0 {
+                    return Err(e);
+                }
+            }
+            "pull" => {
+                let (c, _, e) = run_git_cmd(&root_path, &["pull", "--rebase"]);
+                if c != 0 {
+                    return Err(e);
+                }
+            }
+            "push" => {
+                let args: Vec<&str> = if snap.has_upstream {
+                    vec!["push"]
+                } else {
+                    vec!["push", "-u", "origin", branch.as_str()]
+                };
+                let (c, _, e) = run_git_cmd(&root_path, &args);
+                if c != 0 {
+                    return Err(e);
+                }
+            }
+            _ => {
+                if snap.has_upstream {
+                    let (pc, _, pe) = run_git_cmd(&root_path, &["pull", "--rebase"]);
+                    if pc != 0 {
+                        return Err(pe);
+                    }
+                }
+                let args: Vec<&str> = if snap.has_upstream {
+                    vec!["push"]
+                } else {
+                    vec!["push", "-u", "origin", branch.as_str()]
+                };
+                let (c, _, e) = run_git_cmd(&root_path, &args);
+                if c != 0 {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(collect_git_status(&root_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn git_generate_commit_message(root: String) -> Result<String, String> {
+    let root_path = PathBuf::from(&root);
+    let diff_text = tokio::task::spawn_blocking(move || {
+        let (_, staged, _) = run_git_cmd(&root_path, &["diff", "--cached"]);
+        let working = if staged.trim().is_empty() {
+            run_git_cmd(&root_path, &["diff"]).1
+        } else {
+            staged
+        };
+        let status_short = run_git_cmd(&root_path, &["status", "--short"]).1;
+        let combined = if working.trim().is_empty() { status_short } else { working };
+        combined.chars().take(12000).collect::<String>()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if diff_text.trim().is_empty() {
+        return Err("No changes to summarize.".into());
+    }
+
+    let api_key = resolve_gemini_api_key()?;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "text": format!("Write a single concise conventional git commit message (<= 72 chars on first line, no quotes or markdown) for these changes:\n\n{}", diff_text)
+            }]
+        }],
+        "generationConfig": {
+            "thinkingConfig": { "thinkingLevel": "LOW" }
+        }
+    });
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={}",
+        api_key
+    );
+    let res = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(res.text().await.unwrap_or_else(|_| "Gemini request failed".into()));
+    }
+    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let msg = json["candidates"][0]["content"]["parts"]
+        .as_array()
+        .and_then(|parts| parts.iter().rev().find_map(|p| p["text"].as_str()))
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .to_string();
+    Ok(msg)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -816,7 +1493,18 @@ pub fn run() {
             create_new_workspace_dir,
             chat_gemini,
             cancel_gemini_agent,
-            run_gemini_agent
+            run_gemini_agent,
+            git_status,
+            git_diff_file,
+            git_init_repo,
+            git_stage,
+            git_unstage,
+            git_discard,
+            git_commit,
+            git_branch,
+            git_set_remote,
+            git_sync,
+            git_generate_commit_message
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aetheris");

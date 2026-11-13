@@ -3,6 +3,9 @@ import {
   AgentMode,
   AgentPatch,
   FileNode,
+  GitDiffPreview,
+  GitFileChangeStatus,
+  GitStatusSnapshot,
   ModelEffort,
   RecentWorkspace,
   SearchHit,
@@ -840,3 +843,237 @@ export function removeRecentWorkspace(id: string, source: WorkspaceSource): Rece
   }
   return next;
 }
+
+const EMPTY_GIT_SNAPSHOT: GitStatusSnapshot = {
+  isRepo: false,
+  branch: '',
+  branches: [],
+  remoteUrl: null,
+  ahead: 0,
+  behind: 0,
+  hasUpstream: false,
+  staged: [],
+  changes: [],
+  unpushedFiles: [],
+  pushedFiles: [],
+  commits: [],
+  userName: null,
+  userEmail: null,
+  ghAvailable: false,
+};
+
+async function gitApiRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  const data = (await res.json()) as T & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Git operation failed');
+  }
+  return data;
+}
+
+export async function fetchGitStatus(ctx: ActiveWorkspaceContext): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_status', { root: ctx.nativeRoot });
+  }
+  if (ctx.source === 'local-fs') {
+    return EMPTY_GIT_SNAPSHOT;
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/status`
+  );
+}
+
+export async function fetchGitFileDiff(
+  ctx: ActiveWorkspaceContext,
+  relPath: string,
+  staged: boolean,
+  status: GitFileChangeStatus
+): Promise<GitDiffPreview> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitDiffPreview>('git_diff_file', {
+      root: ctx.nativeRoot,
+      relPath,
+      staged,
+      status,
+    });
+  }
+  if (ctx.source === 'local-fs') {
+    throw new Error('Git CLI diff requires native desktop or local server workspace.');
+  }
+  return gitApiRequest<GitDiffPreview>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/diff?path=${encodeURIComponent(relPath)}&staged=${String(staged)}&status=${encodeURIComponent(status)}`
+  );
+}
+
+export async function initGitRepository(ctx: ActiveWorkspaceContext): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_init_repo', { root: ctx.nativeRoot });
+  }
+  if (ctx.source === 'local-fs') {
+    throw new Error('Open this folder in the native Rust/Tauri app to run Git commands directly on local folders.');
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/init`,
+    { method: 'POST' }
+  );
+}
+
+export async function stageGitFiles(
+  ctx: ActiveWorkspaceContext,
+  paths: string[],
+  all = false
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_stage', { root: ctx.nativeRoot, paths, all });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/stage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths, all }),
+    }
+  );
+}
+
+export async function unstageGitFiles(
+  ctx: ActiveWorkspaceContext,
+  paths: string[],
+  all = false
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_unstage', { root: ctx.nativeRoot, paths, all });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/unstage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths, all }),
+    }
+  );
+}
+
+export async function discardGitChange(
+  ctx: ActiveWorkspaceContext,
+  relPath: string,
+  untracked: boolean
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_discard', {
+      root: ctx.nativeRoot,
+      relPath,
+      untracked,
+    });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/discard`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: relPath, untracked }),
+    }
+  );
+}
+
+export async function commitGitChanges(
+  ctx: ActiveWorkspaceContext,
+  params: {
+    message: string;
+    stageAllIfEmpty?: boolean;
+    userName?: string;
+    userEmail?: string;
+  }
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_commit', {
+      root: ctx.nativeRoot,
+      message: params.message,
+      stageAllIfEmpty: params.stageAllIfEmpty ?? false,
+      userName: params.userName ?? null,
+      userEmail: params.userEmail ?? null,
+    });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/commit`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    }
+  );
+}
+
+export async function runGitBranchAction(
+  ctx: ActiveWorkspaceContext,
+  action: 'checkout' | 'create',
+  name: string
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_branch', {
+      root: ctx.nativeRoot,
+      action,
+      name,
+    });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/branch`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, name }),
+    }
+  );
+}
+
+export async function setGitRemoteOrigin(
+  ctx: ActiveWorkspaceContext,
+  url: string
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_set_remote', {
+      root: ctx.nativeRoot,
+      url,
+    });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/remote`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    }
+  );
+}
+
+export async function syncGitRemote(
+  ctx: ActiveWorkspaceContext,
+  action: 'fetch' | 'pull' | 'push' | 'sync'
+): Promise<GitStatusSnapshot> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<GitStatusSnapshot>('git_sync', {
+      root: ctx.nativeRoot,
+      action,
+    });
+  }
+  return gitApiRequest<GitStatusSnapshot>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/sync`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    }
+  );
+}
+
+export async function generateGitCommitMessage(ctx: ActiveWorkspaceContext): Promise<string> {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
+    return tauriInvoke<string>('git_generate_commit_message', { root: ctx.nativeRoot });
+  }
+  const res = await gitApiRequest<{ message?: string }>(
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/git/commit-message`,
+    { method: 'POST' }
+  );
+  return res.message ?? '';
+}
+

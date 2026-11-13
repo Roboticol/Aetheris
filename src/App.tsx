@@ -14,6 +14,9 @@ import {
   CursorPosition,
   EditorTab,
   FileNode,
+  GitDiffPreview,
+  GitFileEntry,
+  GitStatusSnapshot,
   HomeChatMessage,
   ModelEffort,
   RecentWorkspace,
@@ -24,13 +27,19 @@ import {
 import {
   ActiveWorkspaceContext,
   cancelTauriAgent,
+  commitGitChanges,
   createServerWorkspaceFolder,
   createTauriWorkspaceFolder,
   createWorkspaceEntry,
   deleteWorkspaceEntry,
+  discardGitChange,
   execWorkspaceCommand,
+  fetchGitFileDiff,
+  fetchGitStatus,
   fetchWorkspaceTree,
   flattenFilePaths,
+  generateGitCommitMessage,
+  initGitRepository,
   isTauriRuntime,
   listStarterWorkspaces,
   loadLocalDirHandle,
@@ -41,9 +50,14 @@ import {
   renameWorkspaceEntry,
   resetStarterWorkspace,
   runAgentPlan,
+  runGitBranchAction,
   saveLocalDirHandle,
   searchWorkspace,
   sendHomeChat,
+  setGitRemoteOrigin,
+  stageGitFiles,
+  syncGitRemote,
+  unstageGitFiles,
   writeWorkspaceFile,
 } from './services/transport';
 import {
@@ -64,6 +78,38 @@ import { CommandPalette } from './components/CommandPalette';
 import { HomeScreen } from './components/HomeScreen';
 import { Tooltip } from './components/Tooltip';
 
+const PANEL_SIZES_KEY = 'aetheris.panelSizes';
+
+interface PanelSizes {
+  leftWidth: number;
+  rightWidth: number;
+  terminalHeight: number;
+}
+
+function loadPanelSizes(): PanelSizes {
+  try {
+    const raw = localStorage.getItem(PANEL_SIZES_KEY);
+    if (!raw) return { leftWidth: 288, rightWidth: 380, terminalHeight: 224 };
+    const parsed = JSON.parse(raw) as Partial<PanelSizes>;
+    return {
+      leftWidth:
+        typeof parsed.leftWidth === 'number'
+          ? Math.min(560, Math.max(220, parsed.leftWidth))
+          : 288,
+      rightWidth:
+        typeof parsed.rightWidth === 'number'
+          ? Math.min(640, Math.max(280, parsed.rightWidth))
+          : 380,
+      terminalHeight:
+        typeof parsed.terminalHeight === 'number'
+          ? Math.min(500, Math.max(110, parsed.terminalHeight))
+          : 224,
+    };
+  } catch {
+    return { leftWidth: 288, rightWidth: 380, terminalHeight: 224 };
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<'home' | 'editor'>('home');
   const [starters, setStarters] = useState<WorkspaceSummary[]>([]);
@@ -83,12 +129,14 @@ export default function App() {
   );
   const [cursor, setCursor] = useState<CursorPosition>({ line: 1, col: 1 });
 
-  // Layout panels
+  // Layout panels & resizable dimensions
   const [showLeftSidebar, setShowLeftSidebar] = useState(true);
-  const [sidebarTab, setSidebarTab] = useState<'files' | 'search'>('files');
+  const [sidebarTab, setSidebarTab] = useState<'files' | 'search' | 'github'>('files');
   const [showRightAgent, setShowRightAgent] = useState(true);
   const [showTerminal, setShowTerminal] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [panelSizes, setPanelSizes] = useState<PanelSizes>(() => loadPanelSizes());
+  const [resizingPanel, setResizingPanel] = useState<'left' | 'right' | 'terminal' | null>(null);
 
   // Search & symbol index
   const [searchQuery, setSearchQuery] = useState('');
@@ -105,6 +153,12 @@ export default function App() {
   const [isAgentBusy, setIsAgentBusy] = useState(false);
   const [activeDiffPatchId, setActiveDiffPatchId] = useState<string | null>(null);
   const [hydratedWorkspaceKey, setHydratedWorkspaceKey] = useState<string | null>(null);
+
+  // Git & GitHub Source Control state
+  const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
+  const [isGitLoading, setIsGitLoading] = useState(false);
+  const [isGitBusy, setIsGitBusy] = useState(false);
+  const [activeGitDiff, setActiveGitDiff] = useState<GitDiffPreview | null>(null);
 
   const agentAbortRef = useRef<AbortController | null>(null);
   const followAiRef = useRef(followAi);
@@ -134,6 +188,75 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [banner]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(PANEL_SIZES_KEY, JSON.stringify(panelSizes));
+    } catch {
+      // Storage quota ignored
+    }
+  }, [panelSizes]);
+
+  const startPanelResize = useCallback(
+    (panel: 'left' | 'right' | 'terminal', e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const initial = panelSizes;
+      setResizingPanel(panel);
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = panel === 'terminal' ? 'row-resize' : 'col-resize';
+
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        if (panel === 'left') {
+          const maxLeft = Math.max(260, window.innerWidth - (showRightAgent ? initial.rightWidth : 0) - 260);
+          const nextWidth = Math.min(
+            Math.min(560, maxLeft),
+            Math.max(220, initial.leftWidth + (moveEvent.clientX - startX))
+          );
+          setPanelSizes((prev) => ({ ...prev, leftWidth: Math.round(nextWidth) }));
+        } else if (panel === 'right') {
+          const maxRight = Math.max(300, window.innerWidth - (showLeftSidebar ? initial.leftWidth : 0) - 260);
+          const nextWidth = Math.min(
+            Math.min(640, maxRight),
+            Math.max(280, initial.rightWidth - (moveEvent.clientX - startX))
+          );
+          setPanelSizes((prev) => ({ ...prev, rightWidth: Math.round(nextWidth) }));
+        } else {
+          const maxTerminal = Math.max(160, window.innerHeight - 220);
+          const nextHeight = Math.min(
+            Math.min(520, maxTerminal),
+            Math.max(110, initial.terminalHeight - (moveEvent.clientY - startY))
+          );
+          setPanelSizes((prev) => ({ ...prev, terminalHeight: Math.round(nextHeight) }));
+        }
+      };
+
+      const onMouseUp = () => {
+        setResizingPanel(null);
+        document.body.style.userSelect = '';
+        document.body.style.cursor = '';
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    },
+    [panelSizes, showLeftSidebar, showRightAgent]
+  );
+
+  const refreshGitStatus = useCallback(async (ctx: ActiveWorkspaceContext) => {
+    setIsGitLoading(true);
+    try {
+      const snap = await fetchGitStatus(ctx);
+      setGitStatus(snap);
+    } catch {
+      setGitStatus(null);
+    } finally {
+      setIsGitLoading(false);
+    }
+  }, []);
+
   const refreshWorkspace = useCallback(
     async (ctx: ActiveWorkspaceContext, openFirstFile = false) => {
       try {
@@ -143,6 +266,8 @@ export default function App() {
         const hits = await searchWorkspace(ctx, '', true, nextTree);
         setAllSymbols(hits);
         setSearchHits(hits);
+
+        void refreshGitStatus(ctx);
 
         if (openFirstFile) {
           const paths = flattenFilePaths(nextTree);
@@ -169,7 +294,7 @@ export default function App() {
         showNotice('error', err instanceof Error ? err.message : 'Failed to load workspace');
       }
     },
-    [showNotice]
+    [showNotice, refreshGitStatus]
   );
 
   // Boot: load available workspaces + saved home chat history
@@ -220,6 +345,7 @@ export default function App() {
   const openFile = useCallback(
     async (filePath: string, line?: number) => {
       setActiveDiffPatchId(null);
+      setActiveGitDiff(null);
       const existing = tabs.find((t) => t.path === filePath);
       if (existing) {
         setActiveTabPath(filePath);
@@ -264,11 +390,12 @@ export default function App() {
         const hits = await searchWorkspace(workspaceCtx, searchQuery, symbolsOnly, tree);
         setSearchHits(hits);
         if (!searchQuery.trim()) setAllSymbols(hits);
+        void refreshGitStatus(workspaceCtx);
       } catch (err) {
         showNotice('error', err instanceof Error ? err.message : 'Failed to save file');
       }
     },
-    [activeTabPath, tabs, workspaceCtx, searchQuery, symbolsOnly, tree, showNotice]
+    [activeTabPath, tabs, workspaceCtx, searchQuery, symbolsOnly, tree, showNotice, refreshGitStatus]
   );
 
   // Global keyboard shortcuts
@@ -285,6 +412,10 @@ export default function App() {
         e.preventDefault();
         setShowLeftSidebar(true);
         setSidebarTab('search');
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === 'g') {
+        e.preventDefault();
+        setShowLeftSidebar(true);
+        setSidebarTab('github');
       } else if (mod && e.key.toLowerCase() === 'b') {
         e.preventDefault();
         setShowLeftSidebar((prev) => !prev);
@@ -317,6 +448,8 @@ export default function App() {
       setWorkspaceCtx(nextCtx);
       setTerminalEntries([]);
       setActiveDiffPatchId(null);
+      setActiveGitDiff(null);
+      setGitStatus(null);
       setView('editor');
       setRecentWorkspaces(recordRecentWorkspace(recentEntry));
 
@@ -884,6 +1017,194 @@ export default function App() {
     }
   };
 
+  // GitHub & Source Control handlers
+  const handleGitInitRepo = async () => {
+    setIsGitBusy(true);
+    try {
+      const snap = await initGitRepository(workspaceCtx);
+      setGitStatus(snap);
+      showNotice('info', 'Initialized Git repository.');
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Git init failed');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitStage = async (paths: string[], all = false) => {
+    setIsGitBusy(true);
+    try {
+      const snap = await stageGitFiles(workspaceCtx, paths, all);
+      setGitStatus(snap);
+      if (activeGitDiff && (all || paths.includes(activeGitDiff.path))) {
+        const entry = snap.staged.find((e) => e.path === activeGitDiff.path);
+        if (entry) {
+          const updated = await fetchGitFileDiff(workspaceCtx, entry.path, true, entry.status);
+          setActiveGitDiff(updated);
+        } else {
+          setActiveGitDiff(null);
+        }
+      }
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to stage changes');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitUnstage = async (paths: string[], all = false) => {
+    setIsGitBusy(true);
+    try {
+      const snap = await unstageGitFiles(workspaceCtx, paths, all);
+      setGitStatus(snap);
+      if (activeGitDiff && (all || paths.includes(activeGitDiff.path))) {
+        const entry = snap.changes.find((e) => e.path === activeGitDiff.path);
+        if (entry) {
+          const updated = await fetchGitFileDiff(workspaceCtx, entry.path, false, entry.status);
+          setActiveGitDiff(updated);
+        } else {
+          setActiveGitDiff(null);
+        }
+      }
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to unstage changes');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitDiscard = async (relPath: string, untracked: boolean) => {
+    setIsGitBusy(true);
+    try {
+      const snap = await discardGitChange(workspaceCtx, relPath, untracked);
+      setGitStatus(snap);
+      if (activeGitDiff?.path === relPath) {
+        setActiveGitDiff(null);
+      }
+      await refreshWorkspace(workspaceCtx, false);
+      // Reload open tab from disk if it was reverted
+      const openTab = tabs.find((t) => t.path === relPath);
+      if (openTab) {
+        if (untracked) {
+          setTabs((prev) => prev.filter((t) => t.path !== relPath));
+          if (activeTabPath === relPath) setActiveTabPath(null);
+        } else {
+          try {
+            const diskContent = await readWorkspaceFile(workspaceCtx, relPath);
+            setTabs((prev) =>
+              prev.map((t) =>
+                t.path === relPath
+                  ? { ...t, content: diskContent, savedContent: diskContent, isDirty: false }
+                  : t
+              )
+            );
+          } catch {
+            // File may have been newly added and removed
+          }
+        }
+      }
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to discard changes');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitCommit = async (params: {
+    message: string;
+    stageAllIfEmpty?: boolean;
+    userName?: string;
+    userEmail?: string;
+  }): Promise<boolean> => {
+    setIsGitBusy(true);
+    try {
+      const snap = await commitGitChanges(workspaceCtx, params);
+      setGitStatus(snap);
+      setActiveGitDiff(null);
+      showNotice('info', 'Committed changes to local branch.');
+      return true;
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Commit failed');
+      return false;
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitGenerateCommitMessage = async (): Promise<string> => {
+    try {
+      return await generateGitCommitMessage(workspaceCtx);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Could not generate commit message');
+      return '';
+    }
+  };
+
+  const handleGitBranchAction = async (action: 'checkout' | 'create', name: string) => {
+    setIsGitBusy(true);
+    try {
+      const snap = await runGitBranchAction(workspaceCtx, action, name);
+      setGitStatus(snap);
+      setActiveGitDiff(null);
+      await refreshWorkspace(workspaceCtx, false);
+      showNotice('info', `Switched to branch ${snap.branch}`);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Branch switch failed');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitSetRemote = async (url: string) => {
+    setIsGitBusy(true);
+    try {
+      const snap = await setGitRemoteOrigin(workspaceCtx, url);
+      setGitStatus(snap);
+      showNotice('info', 'Updated origin remote URL.');
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to set remote');
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleGitSync = async (action: 'fetch' | 'pull' | 'push' | 'sync') => {
+    setIsGitBusy(true);
+    try {
+      const snap = await syncGitRemote(workspaceCtx, action);
+      setGitStatus(snap);
+      await refreshWorkspace(workspaceCtx, false);
+      const actionLabel =
+        action === 'fetch'
+          ? 'Fetched from GitHub'
+          : action === 'pull'
+            ? 'Pulled from GitHub'
+            : action === 'push'
+              ? 'Pushed commits to GitHub'
+              : 'Synced with GitHub';
+      showNotice('info', actionLabel);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : `Git ${action} failed`);
+    } finally {
+      setIsGitBusy(false);
+    }
+  };
+
+  const handleOpenGitDiff = async (entry: GitFileEntry) => {
+    try {
+      const preview = await fetchGitFileDiff(
+        workspaceCtx,
+        entry.path,
+        entry.staged,
+        entry.status
+      );
+      setActiveDiffPatchId(null);
+      setActiveGitDiff(preview);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to load diff');
+    }
+  };
+
   const activeTab = useMemo(
     () => tabs.find((t) => t.path === activeTabPath) ?? null,
     [tabs, activeTabPath]
@@ -975,25 +1296,53 @@ export default function App() {
           />
         </main>
       ) : (
-      /* Main 3-column workbench */
+      /* Main 3-column workbench with resizable panels */
       <main className="flex flex-1 min-h-0 overflow-hidden">
         {showLeftSidebar && (
-          <ExplorerSidebar
-            tree={tree}
-            activeFilePath={activeTabPath}
-            dirtyPaths={dirtyPaths}
-            searchHits={searchHits}
-            searchQuery={searchQuery}
-            symbolsOnly={symbolsOnly}
-            isSearching={isSearching}
-            onSelectFile={openFile}
-            onCreateEntry={handleCreateEntry}
-            onRenameEntry={handleRenameEntry}
-            onDeleteEntry={handleDeleteEntry}
-            onSearchChange={handleSearchChange}
-            activeTab={sidebarTab}
-            onTabChange={setSidebarTab}
-          />
+          <>
+            <ExplorerSidebar
+              width={panelSizes.leftWidth}
+              tree={tree}
+              activeFilePath={activeTabPath}
+              dirtyPaths={dirtyPaths}
+              searchHits={searchHits}
+              searchQuery={searchQuery}
+              symbolsOnly={symbolsOnly}
+              isSearching={isSearching}
+              onSelectFile={openFile}
+              onCreateEntry={handleCreateEntry}
+              onRenameEntry={handleRenameEntry}
+              onDeleteEntry={handleDeleteEntry}
+              onSearchChange={handleSearchChange}
+              activeTab={sidebarTab}
+              onTabChange={setSidebarTab}
+              workspaceSource={workspaceCtx.source}
+              gitStatus={gitStatus}
+              isGitLoading={isGitLoading}
+              isGitBusy={isGitBusy}
+              onGitRefresh={() => refreshGitStatus(workspaceCtx)}
+              onGitInitRepo={handleGitInitRepo}
+              onGitStage={handleGitStage}
+              onGitUnstage={handleGitUnstage}
+              onGitDiscard={handleGitDiscard}
+              onGitCommit={handleGitCommit}
+              onGitGenerateCommitMessage={handleGitGenerateCommitMessage}
+              onGitBranchAction={handleGitBranchAction}
+              onGitSetRemote={handleGitSetRemote}
+              onGitSync={handleGitSync}
+              onOpenGitDiff={(entry) => void handleOpenGitDiff(entry)}
+            />
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onMouseDown={(e) => startPanelResize('left', e)}
+              className={`w-1 shrink-0 cursor-col-resize transition-colors ${
+                resizingPanel === 'left'
+                  ? 'bg-[#6366F1]'
+                  : 'bg-transparent hover:bg-[#6366F1]/70'
+              }`}
+            />
+          </>
         )}
 
         {/* Center Editor + Diff + Bottom Terminal */}
@@ -1002,12 +1351,13 @@ export default function App() {
           <div className="flex h-9 shrink-0 items-center justify-between border-b border-[#272B38] bg-[#161922] px-1 select-none">
             <div className="flex flex-1 items-center overflow-x-auto">
               {tabs.map((tab) => {
-                const isActive = !activeDiffPatch && tab.path === activeTabPath;
+                const isActive = !activeDiffPatch && !activeGitDiff && tab.path === activeTabPath;
                 return (
                   <div
                     key={tab.path}
                     onClick={() => {
                       setActiveDiffPatchId(null);
+                      setActiveGitDiff(null);
                       setActiveTabPath(tab.path);
                     }}
                     className={`group flex h-9 cursor-pointer items-center gap-2 border-r border-[#272B38] px-3 text-[12px] transition-colors whitespace-nowrap shrink-0 ${
@@ -1046,6 +1396,20 @@ export default function App() {
                   </button>
                 </div>
               )}
+
+              {activeGitDiff && !activeDiffPatch && (
+                <div className="flex h-9 items-center gap-2 border-r border-[#272B38] bg-[#0F1117] px-3 text-[12px] text-[#818CF8] whitespace-nowrap shrink-0">
+                  <span className="font-mono">Git Diff: {activeGitDiff.path}</span>
+                  <button
+                    type="button"
+                    aria-label="Close git diff view"
+                    onClick={() => setActiveGitDiff(null)}
+                    className="rounded p-0.5 text-[#8B92A5] hover:bg-[#272B38] hover:text-[#E6E8EE]"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center gap-3 px-3 text-[11.5px] text-[#8B92A5] shrink-0">
@@ -1055,7 +1419,7 @@ export default function App() {
                   <span className="hidden sm:inline">Following AI</span>
                 </span>
               )}
-              {activeTab && !activeDiffPatch && (
+              {activeTab && !activeDiffPatch && !activeGitDiff && (
                 <>
                   <span className="hidden md:inline font-mono tabular-nums">
                     Ln {cursor.line}, Col {cursor.col}
@@ -1086,6 +1450,15 @@ export default function App() {
                 onReject={handleRejectPatch}
                 onClose={() => setActiveDiffPatchId(null)}
               />
+            ) : activeGitDiff ? (
+              <DiffViewer
+                gitDiff={activeGitDiff}
+                onOpenFile={(p) => void openFile(p)}
+                onStageGit={(p) => void handleGitStage([p], false)}
+                onUnstageGit={(p) => void handleGitUnstage([p], false)}
+                onDiscardGit={(p, untracked) => void handleGitDiscard(p, untracked)}
+                onClose={() => setActiveGitDiff(null)}
+              />
             ) : activeTab ? (
               <CodeEditor
                 filePath={activeTab.path}
@@ -1093,6 +1466,7 @@ export default function App() {
                 targetLine={
                   jumpTarget && jumpTarget.path === activeTab.path ? jumpTarget.line : null
                 }
+                workspaceSymbols={allSymbols}
                 onChange={(nextValue) => {
                   setTabs((prev) =>
                     prev.map((t) =>
@@ -1140,44 +1514,73 @@ export default function App() {
           </div>
 
           {showTerminal && (
-            <TerminalDrawer
-              workspaceName={workspaceCtx.name}
-              entries={terminalEntries}
-              isRunning={isTerminalRunning}
-              onExecute={handleExecuteCommand}
-              onClear={() => setTerminalEntries([])}
-              onClose={() => setShowTerminal(false)}
-            />
+            <>
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                onMouseDown={(e) => startPanelResize('terminal', e)}
+                className={`h-1 shrink-0 cursor-row-resize transition-colors ${
+                  resizingPanel === 'terminal'
+                    ? 'bg-[#6366F1]'
+                    : 'bg-transparent hover:bg-[#6366F1]/70'
+                }`}
+              />
+              <TerminalDrawer
+                height={panelSizes.terminalHeight}
+                workspaceName={workspaceCtx.name}
+                entries={terminalEntries}
+                isRunning={isTerminalRunning}
+                onExecute={handleExecuteCommand}
+                onClear={() => setTerminalEntries([])}
+                onClose={() => setShowTerminal(false)}
+              />
+            </>
           )}
         </div>
 
         {showRightAgent && (
-          <AgentPanel
-            messages={agentMessages}
-            activeFilePath={activeTabPath}
-            workspaceFileCount={allFilePaths.length}
-            effort={effort}
-            agentMode={agentMode}
-            followAi={followAi}
-            isBusy={isAgentBusy}
-            onEffortChange={setEffort}
-            onAgentModeChange={setAgentMode}
-            onFollowAiChange={setFollowAi}
-            onSendPrompt={handleRunAgent}
-            onCancelPrompt={handleCancelAgent}
-            onOpenFile={(p) => void openFile(p)}
-            onInspectPatch={(patch) => setActiveDiffPatchId(patch.id)}
-            onAcceptPatch={handleAcceptPatch}
-            onRejectPatch={handleRejectPatch}
-            onAcceptAll={handleAcceptAllPatches}
-            onClearHistory={() => {
-              setAgentMessages([]);
-              setActiveDiffPatchId(null);
-              void clearWorkspaceSessionMessages(
-                getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id)
-              );
-            }}
-          />
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onMouseDown={(e) => startPanelResize('right', e)}
+              className={`w-1 shrink-0 cursor-col-resize transition-colors ${
+                resizingPanel === 'right'
+                  ? 'bg-[#6366F1]'
+                  : 'bg-transparent hover:bg-[#6366F1]/70'
+              }`}
+            />
+            <AgentPanel
+              width={panelSizes.rightWidth}
+              messages={agentMessages}
+              activeFilePath={activeTabPath}
+              workspaceFileCount={allFilePaths.length}
+              effort={effort}
+              agentMode={agentMode}
+              followAi={followAi}
+              isBusy={isAgentBusy}
+              onEffortChange={setEffort}
+              onAgentModeChange={setAgentMode}
+              onFollowAiChange={setFollowAi}
+              onSendPrompt={handleRunAgent}
+              onCancelPrompt={handleCancelAgent}
+              onOpenFile={(p) => void openFile(p)}
+              onInspectPatch={(patch) => {
+                setActiveGitDiff(null);
+                setActiveDiffPatchId(patch.id);
+              }}
+              onAcceptPatch={handleAcceptPatch}
+              onRejectPatch={handleRejectPatch}
+              onAcceptAll={handleAcceptAllPatches}
+              onClearHistory={() => {
+                setAgentMessages([]);
+                setActiveDiffPatchId(null);
+                void clearWorkspaceSessionMessages(
+                  getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id)
+                );
+              }}
+            />
+          </>
         )}
       </main>
       )}

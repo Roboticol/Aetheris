@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
@@ -369,6 +369,253 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function runGit(
+  cwd: string,
+  args: string[]
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      args,
+      {
+        cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
+        maxBuffer: 8 * 1024 * 1024,
+      },
+      (err, stdout, stderr) => {
+        const code =
+          err && typeof (err as { code?: unknown }).code === 'number'
+            ? ((err as { code: number }).code)
+            : err
+              ? 1
+              : 0;
+        resolve({
+          code,
+          stdout: stdout ?? '',
+          stderr: stderr ?? '',
+        });
+      }
+    );
+  });
+}
+
+function mapGitCode(ch: string): 'M' | 'A' | 'D' | 'R' | 'U' | 'C' {
+  if (ch === 'A') return 'A';
+  if (ch === 'D') return 'D';
+  if (ch === 'R') return 'R';
+  if (ch === 'U') return 'C';
+  if (ch === '?') return 'U';
+  return 'M';
+}
+
+async function getGitStatusSnapshot(root: string) {
+  const inside = await runGit(root, ['rev-parse', '--is-inside-work-tree']);
+  const ghCheck = await new Promise<boolean>((resolve) => {
+    execFile('gh', ['--version'], (err) => resolve(!err));
+  });
+
+  if (inside.code !== 0 || inside.stdout.trim() !== 'true') {
+    const uName = (await runGit(root, ['config', 'user.name'])).stdout.trim() || null;
+    const uEmail = (await runGit(root, ['config', 'user.email'])).stdout.trim() || null;
+    return {
+      isRepo: false,
+      branch: '',
+      branches: [] as string[],
+      remoteUrl: null as string | null,
+      ahead: 0,
+      behind: 0,
+      hasUpstream: false,
+      staged: [],
+      changes: [],
+      unpushedFiles: [] as string[],
+      pushedFiles: [] as string[],
+      commits: [],
+      userName: uName,
+      userEmail: uEmail,
+      ghAvailable: ghCheck,
+    };
+  }
+
+  const statusRes = await runGit(root, ['status', '--porcelain=v1', '-b', '-uall']);
+  const lines = statusRes.stdout.split(/\r?\n/).filter((l) => l.length > 0);
+  let branch = 'main';
+  const staged: Array<{ path: string; status: 'M' | 'A' | 'D' | 'R' | 'U' | 'C'; staged: boolean }> = [];
+  const changes: Array<{ path: string; status: 'M' | 'A' | 'D' | 'R' | 'U' | 'C'; staged: boolean }> = [];
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      const header = line.slice(3).trim();
+      if (header.startsWith('No commits yet on ')) {
+        branch = header.replace('No commits yet on ', '').trim();
+      } else {
+        const dotIdx = header.indexOf('...');
+        const spaceIdx = header.indexOf(' ');
+        if (dotIdx !== -1) {
+          branch = header.slice(0, dotIdx).trim();
+        } else if (spaceIdx !== -1) {
+          branch = header.slice(0, spaceIdx).trim();
+        } else {
+          branch = header;
+        }
+      }
+      continue;
+    }
+
+    if (line.length < 4) continue;
+    const x = line[0];
+    const y = line[1];
+    let filePath = line.slice(3).trim();
+    if (filePath.includes(' -> ')) {
+      filePath = filePath.split(' -> ').pop()!.trim();
+    }
+    if (filePath.startsWith('"') && filePath.endsWith('"')) {
+      filePath = filePath.slice(1, -1);
+    }
+
+    if (x === '?' && y === '?') {
+      changes.push({ path: filePath, status: 'U', staged: false });
+      continue;
+    }
+
+    if (x !== ' ') {
+      staged.push({
+        path: filePath,
+        status: mapGitCode(x),
+        staged: true,
+      });
+    }
+    if (y !== ' ') {
+      changes.push({
+        path: filePath,
+        status: mapGitCode(y),
+        staged: false,
+      });
+    }
+  }
+
+  const branchRes = await runGit(root, ['branch', '--format=%(refname:short)']);
+  const branches = branchRes.stdout
+    .split(/\r?\n/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+  if (branch && !branches.includes(branch)) {
+    branches.unshift(branch);
+  }
+
+  const remoteRes = await runGit(root, ['remote', 'get-url', 'origin']);
+  const remoteUrl = remoteRes.code === 0 ? remoteRes.stdout.trim() || null : null;
+
+  const upstreamRes = await runGit(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+  let upstreamRef = upstreamRes.code === 0 ? upstreamRes.stdout.trim() : '';
+  if (!upstreamRef && branch && remoteUrl) {
+    const originBranchCheck = await runGit(root, ['rev-parse', '--verify', `origin/${branch}`]);
+    if (originBranchCheck.code === 0) {
+      upstreamRef = `origin/${branch}`;
+    }
+  }
+
+  const hasUpstream = Boolean(upstreamRef);
+  let ahead = 0;
+  let behind = 0;
+  const unpushedSet = new Set<string>();
+  const unpushedHashes = new Set<string>();
+
+  if (upstreamRef) {
+    const countRes = await runGit(root, ['rev-list', '--left-right', '--count', `${upstreamRef}...HEAD`]);
+    if (countRes.code === 0) {
+      const parts = countRes.stdout.trim().split(/\s+/);
+      behind = Number(parts[0] ?? 0) || 0;
+      ahead = Number(parts[1] ?? 0) || 0;
+    }
+
+    const diffRes = await runGit(root, ['diff', '--name-only', `${upstreamRef}..HEAD`]);
+    if (diffRes.code === 0) {
+      for (const f of diffRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+        unpushedSet.add(f);
+      }
+    }
+
+    const revRes = await runGit(root, ['rev-list', `${upstreamRef}..HEAD`]);
+    if (revRes.code === 0) {
+      for (const h of revRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+        unpushedHashes.add(h);
+      }
+    }
+  }
+
+  const trackedRes = await runGit(root, ['ls-files']);
+  const trackedFiles = trackedRes.code === 0
+    ? trackedRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    : [];
+
+  const dirtySet = new Set<string>([
+    ...staged.map((s) => s.path),
+    ...changes.map((c) => c.path),
+  ]);
+
+  if (!hasUpstream) {
+    for (const f of trackedFiles) {
+      if (!dirtySet.has(f)) {
+        unpushedSet.add(f);
+      }
+    }
+  }
+
+  const pushedFiles = hasUpstream
+    ? trackedFiles.filter((f) => !dirtySet.has(f) && !unpushedSet.has(f))
+    : [];
+
+  const logRes = await runGit(root, [
+    'log',
+    '-n',
+    '15',
+    '--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ar',
+  ]);
+  const commits =
+    logRes.code === 0
+      ? logRes.stdout
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((row) => {
+            const [hash = '', shortHash = '', message = '', author = '', relativeTime = ''] =
+              row.split('\x1f');
+            return {
+              hash,
+              shortHash,
+              message,
+              author,
+              relativeTime,
+              pushed: hasUpstream ? !unpushedHashes.has(hash) : false,
+            };
+          })
+      : [];
+
+  if (!hasUpstream && commits.length > 0) {
+    ahead = commits.length;
+  }
+
+  const uName = (await runGit(root, ['config', 'user.name'])).stdout.trim() || null;
+  const uEmail = (await runGit(root, ['config', 'user.email'])).stdout.trim() || null;
+
+  return {
+    isRepo: true,
+    branch,
+    branches,
+    remoteUrl,
+    ahead,
+    behind,
+    hasUpstream,
+    staged,
+    changes,
+    unpushedFiles: Array.from(unpushedSet),
+    pushedFiles,
+    commits,
+    userName: uName,
+    userEmail: uEmail,
+    ghAvailable: ghCheck,
+  };
 }
 
 async function startServer() {
@@ -951,6 +1198,299 @@ async function startServer() {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Chat request failed';
       res.status(500).json({ error: message });
+    }
+  });
+
+  app.get('/api/workspaces/:id/git/status', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const snapshot = await getGitStatusSnapshot(root);
+      res.json(snapshot);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Git status failed' });
+    }
+  });
+
+  app.get('/api/workspaces/:id/git/diff', async (req, res) => {
+    try {
+      const relPath = String(req.query.path ?? '');
+      const staged = req.query.staged === 'true';
+      const status = String(req.query.status ?? 'M');
+      const { root, target } = resolveSafeWorkspacePath(req.params.id, relPath);
+
+      let originalContent = '';
+      let modifiedContent = '';
+
+      if (staged) {
+        const headOut = await runGit(root, ['show', `HEAD:${relPath}`]);
+        if (headOut.code === 0) originalContent = headOut.stdout;
+        if (status !== 'D') {
+          const idxOut = await runGit(root, ['show', `:${relPath}`]);
+          if (idxOut.code === 0) modifiedContent = idxOut.stdout;
+        }
+      } else {
+        if (status !== 'U') {
+          const idxOut = await runGit(root, ['show', `:${relPath}`]);
+          if (idxOut.code === 0) {
+            originalContent = idxOut.stdout;
+          } else {
+            const headOut = await runGit(root, ['show', `HEAD:${relPath}`]);
+            if (headOut.code === 0) originalContent = headOut.stdout;
+          }
+        }
+        if (status !== 'D') {
+          try {
+            modifiedContent = await fs.readFile(target, 'utf-8');
+          } catch {
+            modifiedContent = '';
+          }
+        }
+      }
+
+      res.json({
+        path: relPath,
+        status,
+        staged,
+        originalContent,
+        modifiedContent,
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Git diff failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/init', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      let out = await runGit(root, ['init', '-b', 'main']);
+      if (out.code !== 0) {
+        out = await runGit(root, ['init']);
+      }
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || 'Failed to initialize git repository' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Git init failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/stage', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { paths, all } = req.body as { paths?: string[]; all?: boolean };
+      const args = all ? ['add', '-A'] : ['add', '--', ...(paths ?? [])];
+      const out = await runGit(root, args);
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || 'Failed to stage changes' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Stage failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/unstage', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { paths, all } = req.body as { paths?: string[]; all?: boolean };
+      const hasHead = (await runGit(root, ['rev-parse', '--verify', 'HEAD'])).code === 0;
+      const args = hasHead
+        ? all
+          ? ['reset', 'HEAD']
+          : ['reset', 'HEAD', '--', ...(paths ?? [])]
+        : all
+          ? ['rm', '-r', '--cached', '.']
+          : ['rm', '--cached', '--', ...(paths ?? [])];
+      const out = await runGit(root, args);
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || 'Failed to unstage changes' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unstage failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/discard', async (req, res) => {
+    try {
+      const { path: relPath, untracked } = req.body as { path: string; untracked?: boolean };
+      const { root, target } = resolveSafeWorkspacePath(req.params.id, relPath);
+      if (untracked) {
+        await fs.rm(target, { recursive: true, force: true });
+      } else {
+        const out = await runGit(root, ['checkout', '--', relPath]);
+        if (out.code !== 0) {
+          res.status(400).json({ error: out.stderr || 'Failed to discard changes' });
+          return;
+        }
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Discard failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/commit', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { message, stageAllIfEmpty, userName, userEmail } = req.body as {
+        message: string;
+        stageAllIfEmpty?: boolean;
+        userName?: string;
+        userEmail?: string;
+      };
+      if (!message || !message.trim()) {
+        res.status(400).json({ error: 'Commit message is required.' });
+        return;
+      }
+      if (userName?.trim()) {
+        await runGit(root, ['config', 'user.name', userName.trim()]);
+      }
+      if (userEmail?.trim()) {
+        await runGit(root, ['config', 'user.email', userEmail.trim()]);
+      }
+
+      const snap = await getGitStatusSnapshot(root);
+      if (snap.staged.length === 0 && stageAllIfEmpty) {
+        await runGit(root, ['add', '-A']);
+      }
+
+      const out = await runGit(root, ['commit', '-m', message.trim()]);
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || out.stdout || 'Commit failed' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Commit failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/branch', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { action, name } = req.body as { action: 'checkout' | 'create'; name: string };
+      if (!name || !name.trim()) {
+        res.status(400).json({ error: 'Branch name is required.' });
+        return;
+      }
+      const args = action === 'create' ? ['checkout', '-b', name.trim()] : ['checkout', name.trim()];
+      const out = await runGit(root, args);
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || 'Branch switch failed' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Branch action failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/remote', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { url } = req.body as { url: string };
+      const trimmed = (url ?? '').trim();
+      if (!trimmed) {
+        res.status(400).json({ error: 'Remote URL is required.' });
+        return;
+      }
+      const existing = await runGit(root, ['remote', 'get-url', 'origin']);
+      const out =
+        existing.code === 0
+          ? await runGit(root, ['remote', 'set-url', 'origin', trimmed])
+          : await runGit(root, ['remote', 'add', 'origin', trimmed]);
+      if (out.code !== 0) {
+        res.status(400).json({ error: out.stderr || 'Failed to configure remote origin' });
+        return;
+      }
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Remote update failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/sync', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const { action } = req.body as { action: 'fetch' | 'pull' | 'push' | 'sync' };
+      const snap = await getGitStatusSnapshot(root);
+
+      if (!snap.remoteUrl) {
+        res.status(400).json({ error: 'No GitHub remote "origin" configured yet.' });
+        return;
+      }
+
+      if (action === 'fetch') {
+        const out = await runGit(root, ['fetch', '--all', '--prune']);
+        if (out.code !== 0) {
+          res.status(400).json({ error: out.stderr || 'Fetch failed' });
+          return;
+        }
+      } else if (action === 'pull') {
+        const out = await runGit(root, ['pull', '--rebase']);
+        if (out.code !== 0) {
+          res.status(400).json({ error: out.stderr || 'Pull failed' });
+          return;
+        }
+      } else if (action === 'push') {
+        const args = snap.hasUpstream ? ['push'] : ['push', '-u', 'origin', snap.branch || 'main'];
+        const out = await runGit(root, args);
+        if (out.code !== 0) {
+          res.status(400).json({ error: out.stderr || 'Push failed' });
+          return;
+        }
+      } else {
+        if (snap.hasUpstream) {
+          const pullOut = await runGit(root, ['pull', '--rebase']);
+          if (pullOut.code !== 0) {
+            res.status(400).json({ error: pullOut.stderr || 'Pull during sync failed' });
+            return;
+          }
+        }
+        const pushArgs = snap.hasUpstream ? ['push'] : ['push', '-u', 'origin', snap.branch || 'main'];
+        const pushOut = await runGit(root, pushArgs);
+        if (pushOut.code !== 0) {
+          res.status(400).json({ error: pushOut.stderr || 'Push during sync failed' });
+          return;
+        }
+      }
+
+      res.json(await getGitStatusSnapshot(root));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Git sync failed' });
+    }
+  });
+
+  app.post('/api/workspaces/:id/git/commit-message', async (req, res) => {
+    try {
+      const { root } = resolveSafeWorkspacePath(req.params.id);
+      const stagedDiff = await runGit(root, ['diff', '--cached']);
+      const workingDiff = stagedDiff.stdout.trim()
+        ? stagedDiff.stdout
+        : (await runGit(root, ['diff'])).stdout;
+      const statusShort = (await runGit(root, ['status', '--short'])).stdout;
+      const diffInput = (workingDiff.trim() || statusShort.trim()).slice(0, 12000);
+      if (!diffInput) {
+        res.status(400).json({ error: 'No changes to summarize.' });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Write a single concise conventional git commit message (<= 72 chars on first line, no quotes or markdown) for these changes:\n\n${diffInput}`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      });
+      res.json({ message: (response.text ?? '').trim().replace(/^["'`]+|["'`]+$/g, '') });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to generate commit message' });
     }
   });
 

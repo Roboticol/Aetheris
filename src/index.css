@@ -67,35 +67,162 @@ pre,
   background-clip: content-box;
 }
 
-/* CodeMirror 6 integration styling */
+/* CodeMirror 6 VS Code-style integration styling */
 .cm-editor {
   height: 100%;
   background-color: #0F1117 !important;
   font-size: 13px;
+  line-height: 1.55;
 }
 
 .cm-editor.cm-focused {
   outline: none;
 }
 
+.cm-scroller {
+  font-family: var(--font-mono) !important;
+  line-height: 1.55 !important;
+}
+
 .cm-gutters {
   background-color: #0F1117 !important;
-  border-right: 1px solid #272B38 !important;
+  border-right: none !important;
   color: #52596E !important;
+  padding: 0 !important;
   user-select: none;
 }
 
+.cm-lineNumbers .cm-gutterElement {
+  padding: 0 4px 0 8px !important;
+  min-width: 24px !important;
+  text-align: right;
+  font-size: 12px;
+}
+
+.cm-foldGutter .cm-gutterElement {
+  padding: 0 6px 0 2px !important;
+  color: #52596E;
+}
+
 .cm-activeLineGutter {
-  background-color: #161922 !important;
-  color: #9CA3B8 !important;
+  background-color: #0F1117 !important;
+  color: #E6E8EE !important;
+  font-weight: 500;
+}
+
+.cm-content {
+  padding: 10px 0 !important;
+  caret-color: #818CF8;
+}
+
+.cm-line {
+  padding: 0 16px 0 0 !important;
 }
 
 .cm-activeLine {
-  background-color: rgba(30, 34, 46, 0.55) !important;
+  background-color: rgba(30, 34, 46, 0.45) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035), inset 0 -1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.cm-cursor,
+.cm-dropCursor {
+  border-left: 2px solid #818CF8 !important;
+  margin-left: 0 !important;
 }
 
 .cm-selectionBackground {
   background-color: rgba(99, 102, 241, 0.28) !important;
+}
+
+.cm-matchingBracket {
+  background-color: rgba(99, 102, 241, 0.22) !important;
+  outline: 1px solid rgba(129, 140, 248, 0.55);
+  border-radius: 2px;
+  color: #E6E8EE !important;
+}
+
+/* VS Code-style IntelliSense Autocomplete Popup */
+.cm-tooltip.cm-tooltip-autocomplete {
+  background-color: #161922 !important;
+  border: 1px solid #272B38 !important;
+  border-radius: 6px !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55) !important;
+  overflow: hidden;
+  padding: 4px !important;
+  min-width: 260px;
+  max-width: 440px;
+  z-index: 60 !important;
+}
+
+.cm-tooltip-autocomplete > ul {
+  max-height: 240px !important;
+  font-family: var(--font-mono) !important;
+  font-size: 12px !important;
+}
+
+.cm-tooltip-autocomplete > ul > li {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px !important;
+  border-radius: 4px;
+  color: #B5BBC9 !important;
+  line-height: 1.4;
+}
+
+.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background-color: rgba(99, 102, 241, 0.25) !important;
+  color: #E6E8EE !important;
+}
+
+.cm-completionMatchedText {
+  color: #818CF8 !important;
+  font-weight: 600;
+  text-decoration: none !important;
+}
+
+.cm-completionDetail {
+  margin-left: auto;
+  padding-left: 14px;
+  font-style: normal !important;
+  font-size: 11px;
+  color: #6B7280;
+}
+
+.cm-tooltip-autocomplete > ul > li[aria-selected] .cm-completionDetail {
+  color: #9CA3B8;
+}
+
+.cm-completionIcon {
+  opacity: 0.92;
+  padding-right: 2px !important;
+}
+
+.cm-completionIcon-function {
+  color: #C084FC;
+}
+
+.cm-completionIcon-keyword {
+  color: #818CF8;
+}
+
+.cm-completionIcon-class,
+.cm-completionIcon-type {
+  color: #FBBF24;
+}
+
+.cm-completionIcon-interface,
+.cm-completionIcon-enum {
+  color: #38BDF8;
+}
+
+.cm-completionIcon-variable,
+.cm-completionIcon-property {
+  color: #60A5FA;
+}
+
+.cm-completionIcon-constant {
+  color: #34D399;
 }
 
 @media (prefers-reduced-motion: reduce) {

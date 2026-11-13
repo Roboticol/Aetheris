@@ -27,6 +27,7 @@ import {
 import { Tooltip } from './Tooltip';
 
 interface AgentPanelProps {
+  width: number;
   messages: AgentMessage[];
   activeFilePath: string | null;
   workspaceFileCount: number;
@@ -166,6 +167,7 @@ const ActivityFeed: React.FC<{
 };
 
 export const AgentPanel: React.FC<AgentPanelProps> = ({
+  width,
   messages,
   activeFilePath,
   workspaceFileCount,
@@ -203,7 +205,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   };
 
   return (
-    <aside className="flex h-full w-80 lg:w-96 shrink-0 flex-col border-l border-[#272B38] bg-[#161922]">
+    <aside
+      style={{ width }}
+      className="flex h-full shrink-0 flex-col border-l border-[#272B38] bg-[#161922] min-w-0"
+    >
       {/* Header */}
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-[#272B38] px-3 select-none">
         <div className="flex items-center gap-2 min-w-0">

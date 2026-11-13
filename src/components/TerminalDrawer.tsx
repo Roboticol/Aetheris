@@ -4,6 +4,7 @@ import { TerminalEntry } from '../types/ide';
 import { Tooltip } from './Tooltip';
 
 interface TerminalDrawerProps {
+  height: number;
   workspaceName: string;
   entries: TerminalEntry[];
   isRunning: boolean;
@@ -13,6 +14,7 @@ interface TerminalDrawerProps {
 }
 
 export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
+  height,
   workspaceName,
   entries,
   isRunning,
@@ -68,7 +70,10 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   };
 
   return (
-    <section className="flex h-56 shrink-0 flex-col border-t border-[#272B38] bg-[#161922]">
+    <section
+      style={{ height }}
+      className="flex shrink-0 flex-col border-t border-[#272B38] bg-[#161922] min-h-0"
+    >
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#272B38] px-3 select-none">
         <div className="flex items-center gap-2 text-[12px] font-medium text-[#E6E8EE]">
           <TerminalIcon className="h-3.5 w-3.5 text-[#818CF8]" />

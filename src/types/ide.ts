@@ -102,3 +102,52 @@ export interface HomeChatMessage {
   timestamp: string;
   error?: string;
 }
+
+export type GitFileChangeStatus = 'M' | 'A' | 'D' | 'R' | 'U' | 'C';
+
+export type ExplorerGitBadge =
+  | GitFileChangeStatus
+  | 'unpushed'
+  | 'pushed';
+
+export interface GitFileEntry {
+  path: string;
+  status: GitFileChangeStatus;
+  staged: boolean;
+}
+
+export interface GitCommitInfo {
+  hash: string;
+  shortHash: string;
+  message: string;
+  author: string;
+  relativeTime: string;
+  pushed: boolean;
+}
+
+export interface GitStatusSnapshot {
+  isRepo: boolean;
+  branch: string;
+  branches: string[];
+  remoteUrl: string | null;
+  ahead: number;
+  behind: number;
+  hasUpstream: boolean;
+  staged: GitFileEntry[];
+  changes: GitFileEntry[];
+  unpushedFiles: string[];
+  pushedFiles: string[];
+  commits: GitCommitInfo[];
+  userName: string | null;
+  userEmail: string | null;
+  ghAvailable: boolean;
+}
+
+export interface GitDiffPreview {
+  path: string;
+  status: GitFileChangeStatus;
+  staged: boolean;
+  originalContent: string;
+  modifiedContent: string;
+}
+

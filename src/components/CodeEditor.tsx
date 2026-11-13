@@ -1,22 +1,31 @@
 import React, { useEffect, useRef } from 'react';
 import { basicSetup } from 'codemirror';
-import { Compartment, EditorState } from '@codemirror/state';
-import { EditorView, keymap } from '@codemirror/view';
+import {
+  autocompletion,
+  completionKeymap,
+  startCompletion,
+} from '@codemirror/autocomplete';
 import { indentWithTab } from '@codemirror/commands';
+import { indentUnit } from '@codemirror/language';
+import { Compartment, EditorState } from '@codemirror/state';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { rust } from '@codemirror/lang-rust';
-import { javascript } from '@codemirror/lang-javascript';
-import { python } from '@codemirror/lang-python';
-import { json } from '@codemirror/lang-json';
-import { html } from '@codemirror/lang-html';
+import { EditorView, keymap } from '@codemirror/view';
 import { css } from '@codemirror/lang-css';
+import { html } from '@codemirror/lang-html';
+import { javascript } from '@codemirror/lang-javascript';
+import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
-import { CursorPosition } from '../types/ide';
+import { python } from '@codemirror/lang-python';
+import { rust } from '@codemirror/lang-rust';
+import { createIdeCompletionSource } from '../services/editorCompletions';
+import { detectIndentWidth, vscodeIndentGuides } from '../services/indentGuides';
+import { CursorPosition, SearchHit } from '../types/ide';
 
 interface CodeEditorProps {
   filePath: string;
   value: string;
   targetLine?: number | null;
+  workspaceSymbols?: SearchHit[];
   onChange: (nextValue: string) => void;
   onSave: () => void;
   onCursorChange: (pos: CursorPosition) => void;
@@ -43,6 +52,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   filePath,
   value,
   targetLine,
+  workspaceSymbols = [],
   onChange,
   onSave,
   onCursorChange,
@@ -54,20 +64,40 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const onChangeRef = useRef(onChange);
   const onSaveRef = useRef(onSave);
   const onCursorRef = useRef(onCursorChange);
+  const workspaceSymbolsRef = useRef(workspaceSymbols);
   onChangeRef.current = onChange;
   onSaveRef.current = onSave;
   onCursorRef.current = onCursorChange;
+  workspaceSymbolsRef.current = workspaceSymbols;
 
   useEffect(() => {
     if (!containerRef.current) return;
+
+    const detectedIndent = detectIndentWidth(value, filePath);
 
     const state = EditorState.create({
       doc: value,
       extensions: [
         basicSetup,
         oneDark,
+        EditorState.tabSize.of(detectedIndent),
+        indentUnit.of(' '.repeat(detectedIndent)),
+        vscodeIndentGuides(detectedIndent),
         langCompartmentRef.current.of(getLanguageExtension(filePath)),
+        autocompletion({
+          override: [
+            createIdeCompletionSource(filePath, () => workspaceSymbolsRef.current),
+          ],
+          activateOnTyping: true,
+          icons: true,
+          maxRenderedOptions: 40,
+        }),
         keymap.of([
+          ...completionKeymap,
+          {
+            key: 'Ctrl-Space',
+            run: startCompletion,
+          },
           indentWithTab,
           {
             key: 'Mod-s',
