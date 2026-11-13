@@ -5,7 +5,7 @@ This directory holds the Rust + Tauri v2 backend (`src-tauri/src/lib.rs`) and Ar
 ## Arch Linux (KDE Plasma)
 
 ```bash
-sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3 librsvg rust cargo
+sudo pacman -Syu --needed webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3 librsvg rust cargo
 npm install
 cargo install tauri-cli
 cargo tauri build

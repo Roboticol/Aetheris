@@ -25,7 +25,7 @@ I daily-drive Arch with KDE Plasma, so there is a `PKGBUILD` included under `src
 Install the system dependencies on Arch:
 
 ```bash
-sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3 librsvg rust cargo
+sudo pacman -Syu --needed webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3 librsvg rust cargo
 ```
 
 Install JS dependencies and build the native binary:
