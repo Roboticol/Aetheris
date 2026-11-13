@@ -1,0 +1,6 @@
+{
+  "name": "Aetheris",
+  "description": "Lightweight Rust-native agentic coding IDE powered by Tauri v2 and Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,24 @@
+# Maintainer: Aetheris Contributors
+pkgname=aetheris
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Lightweight Rust-native agentic coding IDE powered by Tauri v2 and Gemini"
+arch=('x86_64' 'aarch64')
+url="https://github.com/aetheris-ide/aetheris"
+license=('Apache-2.0')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'openssl')
+makedepends=('rust' 'cargo' 'nodejs' 'npm')
+source=()
+
+build() {
+  cd "$startdir/.."
+  npm ci
+  npm run build
+  cd src-tauri
+  cargo build --release --locked
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "src-tauri/target/release/aetheris" "$pkgdir/usr/bin/aetheris"
+}

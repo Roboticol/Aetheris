@@ -1,0 +1,33 @@
+[package]
+name = "aetheris"
+version = "0.1.0"
+description = "Lightweight Rust-native agentic coding IDE for Linux and Windows"
+authors = ["Aetheris Contributors"]
+edition = "2021"
+
+[lib]
+name = "aetheris_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+ignore = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+keyring = "3"
+dirs = "5"
+toml = "0.8"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
