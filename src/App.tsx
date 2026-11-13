@@ -729,7 +729,7 @@ export default function App() {
     setIsHomeChatBusy(true);
 
     try {
-      const { reply, createdProjects } = await sendHomeChat(
+      const { reply, createdProjects, sources, searchQueries } = await sendHomeChat(
         nextHistory
           .filter((m) => !m.error)
           .map((m) => ({ role: m.role, content: m.content }))
@@ -770,6 +770,8 @@ export default function App() {
           role: 'assistant',
           content: reply,
           createdProjects: createdProjects.length > 0 ? createdProjects : undefined,
+          sources: sources.length > 0 ? sources : undefined,
+          searchQueries: searchQueries.length > 0 ? searchQueries : undefined,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ]);
@@ -1001,6 +1003,8 @@ export default function App() {
                 patches: result.patches,
                 thoughts: result.thoughts || m.thoughts,
                 thinkingDurationMs: result.thinkingDurationMs,
+                sources: result.sources.length > 0 ? result.sources : undefined,
+                searchQueries: result.searchQueries.length > 0 ? result.searchQueries : undefined,
                 isStreaming: false,
                 activity: (m.activity ?? []).map((a) => ({ ...a, status: 'done' })),
                 timestamp: new Date().toLocaleTimeString([], {

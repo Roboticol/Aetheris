@@ -7,6 +7,7 @@ import {
   GitDiffPreview,
   GitFileChangeStatus,
   GitStatusSnapshot,
+  GroundingSource,
   ModelEffort,
   RecentWorkspace,
   SearchHit,
@@ -478,6 +479,8 @@ export async function runAgentPlan(params: {
   patches: AgentPatch[];
   thoughts: string;
   thinkingDurationMs: number;
+  sources: GroundingSource[];
+  searchQueries: string[];
 }> {
   const {
     ctx,
@@ -506,6 +509,8 @@ export async function runAgentPlan(params: {
     }>;
     thoughts: string;
     thinkingDurationMs: number;
+    sources: GroundingSource[];
+    searchQueries: string[];
   };
 
   if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
@@ -530,6 +535,8 @@ export async function runAgentPlan(params: {
         }>;
         thoughts?: string;
         thinkingDurationMs?: number;
+        sources?: GroundingSource[];
+        searchQueries?: string[];
       }>('run_gemini_agent', {
         root: ctx.nativeRoot,
         prompt,
@@ -546,6 +553,8 @@ export async function runAgentPlan(params: {
         patches: tauriRes.patches ?? [],
         thoughts: tauriRes.thoughts ?? '',
         thinkingDurationMs: tauriRes.thinkingDurationMs ?? 0,
+        sources: Array.isArray(tauriRes.sources) ? tauriRes.sources : [],
+        searchQueries: Array.isArray(tauriRes.searchQueries) ? tauriRes.searchQueries : [],
       };
     } catch (err) {
       if (signal?.aborted || (err instanceof Error && err.message === 'CANCELLED')) {
@@ -646,6 +655,8 @@ export async function runAgentPlan(params: {
                   }>;
                   thoughts?: string;
                   thinkingDurationMs?: number;
+                  sources?: GroundingSource[];
+                  searchQueries?: string[];
                 }
               | { type: 'error'; error?: string };
 
@@ -660,6 +671,8 @@ export async function runAgentPlan(params: {
                 patches: evt.patches ?? [],
                 thoughts: evt.thoughts ?? '',
                 thinkingDurationMs: evt.thinkingDurationMs ?? 0,
+                sources: Array.isArray(evt.sources) ? evt.sources : [],
+                searchQueries: Array.isArray(evt.searchQueries) ? evt.searchQueries : [],
               };
             }
           }
@@ -688,6 +701,8 @@ export async function runAgentPlan(params: {
         }>;
         thoughts?: string;
         thinkingDurationMs?: number;
+        sources?: GroundingSource[];
+        searchQueries?: string[];
       };
       rawResult = {
         summary: data.summary ?? 'Completed analysis.',
@@ -695,6 +710,8 @@ export async function runAgentPlan(params: {
         patches: data.patches ?? [],
         thoughts: data.thoughts ?? '',
         thinkingDurationMs: data.thinkingDurationMs ?? 0,
+        sources: Array.isArray(data.sources) ? data.sources : [],
+        searchQueries: Array.isArray(data.searchQueries) ? data.searchQueries : [],
       };
     }
   }
@@ -728,6 +745,8 @@ export async function runAgentPlan(params: {
     patches,
     thoughts: rawResult.thoughts,
     thinkingDurationMs: rawResult.thinkingDurationMs,
+    sources: rawResult.sources,
+    searchQueries: rawResult.searchQueries,
   };
 }
 
@@ -792,15 +811,24 @@ export async function createTauriWorkspaceFolder(
 
 export async function sendHomeChat(
   messages: Array<{ role: 'user' | 'assistant'; content: string }>
-): Promise<{ reply: string; createdProjects: CreatedProjectSummary[] }> {
+): Promise<{
+  reply: string;
+  createdProjects: CreatedProjectSummary[];
+  sources: GroundingSource[];
+  searchQueries: string[];
+}> {
   if (isTauriRuntime()) {
-    const res = await tauriInvoke<{ reply?: string; createdProjects?: CreatedProjectSummary[] }>(
-      'chat_gemini',
-      { messages }
-    );
+    const res = await tauriInvoke<{
+      reply?: string;
+      createdProjects?: CreatedProjectSummary[];
+      sources?: GroundingSource[];
+      searchQueries?: string[];
+    }>('chat_gemini', { messages });
     return {
       reply: res.reply ?? '',
       createdProjects: Array.isArray(res.createdProjects) ? res.createdProjects : [],
+      sources: Array.isArray(res.sources) ? res.sources : [],
+      searchQueries: Array.isArray(res.searchQueries) ? res.searchQueries : [],
     };
   }
   const res = await fetch('/api/agent/chat', {
@@ -811,6 +839,8 @@ export async function sendHomeChat(
   const data = (await res.json()) as {
     reply?: string;
     createdProjects?: CreatedProjectSummary[];
+    sources?: GroundingSource[];
+    searchQueries?: string[];
     error?: string;
   };
   if (!res.ok) {
@@ -819,6 +849,8 @@ export async function sendHomeChat(
   return {
     reply: data.reply ?? '',
     createdProjects: Array.isArray(data.createdProjects) ? data.createdProjects : [],
+    sources: Array.isArray(data.sources) ? data.sources : [],
+    searchQueries: Array.isArray(data.searchQueries) ? data.searchQueries : [],
   };
 }
 

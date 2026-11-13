@@ -6,9 +6,11 @@ import {
   CheckCheck,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   Eye,
   FileCode2,
   FileDiff,
+  Globe,
   ListChecks,
   Loader2,
   Play,
@@ -144,6 +146,8 @@ const ActivityFeed: React.FC<{
           <div className="flex min-w-0 items-center gap-1.5">
             {item.status === 'running' ? (
               <Loader2 className="h-3 w-3 shrink-0 animate-spin text-[#818CF8]" />
+            ) : item.kind === 'search' ? (
+              <Globe className="h-3 w-3 shrink-0 text-sky-400" />
             ) : item.kind === 'edit' ? (
               <FileDiff className="h-3 w-3 shrink-0 text-emerald-400" />
             ) : item.kind === 'read' ? (
@@ -398,6 +402,30 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     </span>
                   </div>
                 ) : null}
+
+                {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && (
+                  <div className="rounded-md border border-[#272B38]/80 bg-[#0F1117]/70 px-2.5 py-2 space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-[#8B92A5]">
+                      <Globe className="h-3 w-3 text-sky-400" />
+                      <span>Google Search Sources</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {msg.sources.map((src) => (
+                        <a
+                          key={src.uri}
+                          href={src.uri}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={src.uri}
+                          className="inline-flex max-w-full items-center gap-1 rounded border border-[#272B38] bg-[#161922] px-2 py-0.5 text-[11px] text-[#C7D2FE] hover:border-[#6366F1]/60 hover:text-white transition-colors"
+                        >
+                          <span className="truncate max-w-[200px]">{src.title}</span>
+                          <ExternalLink className="h-2.5 w-2.5 shrink-0 text-[#8B92A5]" />
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {msg.role === 'assistant' &&
                   msg.mode === 'plan' &&

@@ -1467,8 +1467,8 @@ async function startServer() {
         effort === 'xhigh' ? 24 : effort === 'high' ? 18 : effort === 'low' ? 8 : 14;
 
       const systemInstruction = isPlanMode
-        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.'
-        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).';
+        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.'
+        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).';
 
       const priorTurns: Content[] = (history ?? [])
         .filter((h) => h.content && h.content.trim())
@@ -1494,6 +1494,9 @@ async function startServer() {
       let thoughtsAccum = '';
       let thoughtStartMs: number | null = null;
       let thoughtEndMs: number | null = null;
+      const groundingSourcesMap = new Map<string, { title: string; uri: string }>();
+      const searchQueriesSet = new Set<string>();
+      const emittedSearchQueries = new Set<string>();
 
       for (let turn = 0; turn < maxTurns; turn++) {
         if (clientClosed || abortController.signal.aborted) break;
@@ -1508,7 +1511,11 @@ async function startServer() {
               thinkingLevel,
               includeThoughts: true,
             },
-            tools: [{ functionDeclarations: declarations }],
+            tools: [
+              { googleSearch: {} },
+              { functionDeclarations: declarations },
+            ],
+            toolConfig: { includeServerSideToolInvocations: true },
           },
         });
 
@@ -1519,9 +1526,47 @@ async function startServer() {
         for await (const chunk of stream) {
           if (clientClosed || abortController.signal.aborted) break;
 
+          const gm = chunk.candidates?.[0]?.groundingMetadata;
+          if (gm) {
+            if (Array.isArray(gm.webSearchQueries)) {
+              for (const q of gm.webSearchQueries) {
+                const trimmedQ = typeof q === 'string' ? q.trim() : '';
+                if (!trimmedQ) continue;
+                searchQueriesSet.add(trimmedQ);
+                if (!emittedSearchQueries.has(trimmedQ)) {
+                  emittedSearchQueries.add(trimmedQ);
+                  emitEvent({
+                    type: 'activity',
+                    activity: {
+                      id: `gsearch-${turn}-${emittedSearchQueries.size}`,
+                      kind: 'search',
+                      label: `Google Search: "${trimmedQ.slice(0, 48)}"`,
+                      status: 'done',
+                    },
+                  });
+                }
+              }
+            }
+            if (Array.isArray(gm.groundingChunks)) {
+              for (const gChunk of gm.groundingChunks) {
+                const uri = gChunk.web?.uri?.trim();
+                if (!uri) continue;
+                const title = gChunk.web?.title?.trim() || uri;
+                if (!groundingSourcesMap.has(uri)) {
+                  groundingSourcesMap.set(uri, { title, uri });
+                }
+              }
+            }
+          }
+
           const parts = chunk.candidates?.[0]?.content?.parts ?? [];
           for (const part of parts) {
-            const pAny = part as Part & { thought?: boolean; thoughtSignature?: string };
+            const pAny = part as Part & {
+              thought?: boolean;
+              thoughtSignature?: string;
+              toolCall?: { id?: string; toolType?: string; args?: Record<string, unknown> };
+              toolResponse?: unknown;
+            };
             const textPiece = typeof pAny.text === 'string' ? pAny.text : '';
 
             if (pAny.thought) {
@@ -1541,6 +1586,9 @@ async function startServer() {
                 name: pAny.functionCall.name ?? '',
                 args: (pAny.functionCall.args as Record<string, unknown>) ?? {},
               });
+            } else if (pAny.toolCall || pAny.toolResponse) {
+              // Preserve server-side tool invocation & response parts for multi-turn hybrid grounding
+              modelParts.push(part);
             } else if (textPiece || pAny.thoughtSignature) {
               if (textPiece) turnText += textPiece;
               const last = modelParts[modelParts.length - 1] as
@@ -1550,6 +1598,8 @@ async function startServer() {
                 last &&
                 typeof last.text === 'string' &&
                 !last.functionCall &&
+                !last.toolCall &&
+                !last.toolResponse &&
                 !last.thoughtSignature &&
                 !pAny.thoughtSignature
               ) {
@@ -1557,6 +1607,8 @@ async function startServer() {
               } else {
                 modelParts.push({ ...part });
               }
+            } else {
+              modelParts.push(part);
             }
           }
         }
@@ -1631,6 +1683,8 @@ async function startServer() {
         patches,
         thoughts: thoughtsAccum.trim(),
         thinkingDurationMs,
+        sources: Array.from(groundingSourcesMap.values()),
+        searchQueries: Array.from(searchQueriesSet),
       });
 
       if (!res.writableEnded) res.end();
@@ -1852,17 +1906,43 @@ async function startServer() {
       }));
 
       let replyText = '';
+      const groundingSourcesMap = new Map<string, { title: string; uri: string }>();
+      const searchQueriesSet = new Set<string>();
+
       for (let turn = 0; turn < 8; turn++) {
         const response = await ai.models.generateContent({
           model: 'gemini-4-hydrogen',
           contents,
           config: {
             systemInstruction:
-              'You are Aetheris Quick Chat on the Home Screen. You help users brainstorm or start new projects. PERMISSIONS: You have CREATE-ONLY permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list.',
+              'You are Aetheris Quick Chat on the Home Screen. You help users brainstorm, look up current technical information via Google Search, or start new projects. PERMISSIONS: You have CREATE-ONLY workspace permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list. Use Google Search grounding whenever up-to-date web facts, documentation, or current information are needed.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            tools: [{ functionDeclarations: [createProjectDecl, createFolderDecl, createFileDecl] }],
+            tools: [
+              { googleSearch: {} },
+              { functionDeclarations: [createProjectDecl, createFolderDecl, createFileDecl] },
+            ],
+            toolConfig: { includeServerSideToolInvocations: true },
           },
         });
+
+        const gm = response.candidates?.[0]?.groundingMetadata;
+        if (gm) {
+          if (Array.isArray(gm.webSearchQueries)) {
+            for (const q of gm.webSearchQueries) {
+              if (typeof q === 'string' && q.trim()) searchQueriesSet.add(q.trim());
+            }
+          }
+          if (Array.isArray(gm.groundingChunks)) {
+            for (const gChunk of gm.groundingChunks) {
+              const uri = gChunk.web?.uri?.trim();
+              if (!uri) continue;
+              const title = gChunk.web?.title?.trim() || uri;
+              if (!groundingSourcesMap.has(uri)) {
+                groundingSourcesMap.set(uri, { title, uri });
+              }
+            }
+          }
+        }
 
         const candidateContent = response.candidates?.[0]?.content;
         const calls = response.functionCalls ?? [];
@@ -1894,6 +1974,8 @@ async function startServer() {
       res.json({
         reply: replyText || 'Done.',
         createdProjects: Array.from(createdProjectsMap.values()),
+        sources: Array.from(groundingSourcesMap.values()),
+        searchQueries: Array.from(searchQueriesSet),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Chat request failed';

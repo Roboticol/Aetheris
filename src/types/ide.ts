@@ -52,9 +52,14 @@ export interface AgentPatch {
 export type ModelEffort = 'low' | 'medium' | 'high' | 'xhigh';
 export type AgentMode = 'plan' | 'action';
 
+export interface GroundingSource {
+  title: string;
+  uri: string;
+}
+
 export interface AgentActivityItem {
   id: string;
-  kind: 'read' | 'think' | 'edit' | 'plan' | 'done';
+  kind: 'read' | 'think' | 'edit' | 'plan' | 'done' | 'search';
   label: string;
   filePath?: string;
   status: 'running' | 'done';
@@ -71,6 +76,8 @@ export interface AgentMessage {
   activity?: AgentActivityItem[];
   steps?: string[];
   patches?: AgentPatch[];
+  sources?: GroundingSource[];
+  searchQueries?: string[];
   timestamp: string;
   error?: string;
   isStreaming?: boolean;
@@ -109,6 +116,8 @@ export interface HomeChatMessage {
   content: string;
   timestamp: string;
   createdProjects?: CreatedProjectSummary[];
+  sources?: GroundingSource[];
+  searchQueries?: string[];
   error?: string;
 }
 

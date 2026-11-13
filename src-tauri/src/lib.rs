@@ -53,6 +53,13 @@ pub struct AgentPatch {
     pub original_content: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingSource {
+    pub title: String,
+    pub uri: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPlanResponse {
@@ -61,6 +68,8 @@ pub struct AgentPlanResponse {
     pub patches: Vec<AgentPatch>,
     pub thoughts: String,
     pub thinking_duration_ms: u64,
+    pub sources: Vec<GroundingSource>,
+    pub search_queries: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -78,6 +87,8 @@ pub struct CreatedProjectSummary {
 pub struct QuickChatResponse {
     pub reply: String,
     pub created_projects: Vec<CreatedProjectSummary>,
+    pub sources: Vec<GroundingSource>,
+    pub search_queries: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,65 +504,68 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<QuickChatResponse, 
         return Err("Message cannot be empty.".into());
     }
 
-    let tools = serde_json::json!([{
-        "functionDeclarations": [
-            {
-                "name": "create_project",
-                "description": "Create a brand-new project workspace under ~/AetherisProjects with folders and starter files. Automatically registers it on the Home screen project list. Create-only: never overwrites existing files.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "project_name": { "type": "STRING", "description": "Slug folder name (letters, numbers, hyphens, underscores)." },
-                        "description": { "type": "STRING", "description": "Short 1-line project summary." },
-                        "language": { "type": "STRING", "description": "Primary language (e.g. Rust, TypeScript, Python)." },
-                        "folders": {
-                            "type": "ARRAY",
-                            "items": { "type": "STRING" },
-                            "description": "Optional relative folder paths inside the project."
-                        },
-                        "files": {
-                            "type": "ARRAY",
-                            "description": "Starter files to create inside the project.",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "path": { "type": "STRING", "description": "Relative path inside project." },
-                                    "content": { "type": "STRING", "description": "Initial file content." }
-                                },
-                                "required": ["path", "content"]
+    let tools = serde_json::json!([
+        { "googleSearch": {} },
+        {
+            "functionDeclarations": [
+                {
+                    "name": "create_project",
+                    "description": "Create a brand-new project workspace under ~/AetherisProjects with folders and starter files. Automatically registers it on the Home screen project list. Create-only: never overwrites existing files.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "project_name": { "type": "STRING", "description": "Slug folder name (letters, numbers, hyphens, underscores)." },
+                            "description": { "type": "STRING", "description": "Short 1-line project summary." },
+                            "language": { "type": "STRING", "description": "Primary language (e.g. Rust, TypeScript, Python)." },
+                            "folders": {
+                                "type": "ARRAY",
+                                "items": { "type": "STRING" },
+                                "description": "Optional relative folder paths inside the project."
+                            },
+                            "files": {
+                                "type": "ARRAY",
+                                "description": "Starter files to create inside the project.",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "path": { "type": "STRING", "description": "Relative path inside project." },
+                                        "content": { "type": "STRING", "description": "Initial file content." }
+                                    },
+                                    "required": ["path", "content"]
+                                }
                             }
-                        }
-                    },
-                    "required": ["project_name", "description", "language", "files"]
+                        },
+                        "required": ["project_name", "description", "language", "files"]
+                    }
+                },
+                {
+                    "name": "create_folder",
+                    "description": "Create a new folder inside a project workspace (creates the project if new). Does not modify or delete existing files.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "project_name": { "type": "STRING", "description": "Project directory slug." },
+                            "folder_path": { "type": "STRING", "description": "Relative folder path inside project." }
+                        },
+                        "required": ["project_name", "folder_path"]
+                    }
+                },
+                {
+                    "name": "create_file",
+                    "description": "Create a NEW file inside a project workspace. Strictly create-only: fails if the file already exists.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "project_name": { "type": "STRING", "description": "Project directory slug." },
+                            "file_path": { "type": "STRING", "description": "Relative file path inside project." },
+                            "content": { "type": "STRING", "description": "Initial content for the new file." }
+                        },
+                        "required": ["project_name", "file_path", "content"]
+                    }
                 }
-            },
-            {
-                "name": "create_folder",
-                "description": "Create a new folder inside a project workspace (creates the project if new). Does not modify or delete existing files.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "project_name": { "type": "STRING", "description": "Project directory slug." },
-                        "folder_path": { "type": "STRING", "description": "Relative folder path inside project." }
-                    },
-                    "required": ["project_name", "folder_path"]
-                }
-            },
-            {
-                "name": "create_file",
-                "description": "Create a NEW file inside a project workspace. Strictly create-only: fails if the file already exists.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "project_name": { "type": "STRING", "description": "Project directory slug." },
-                        "file_path": { "type": "STRING", "description": "Relative file path inside project." },
-                        "content": { "type": "STRING", "description": "Initial content for the new file." }
-                    },
-                    "required": ["project_name", "file_path", "content"]
-                }
-            }
-        ]
-    }]);
+            ]
+        }
+    ]);
 
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={}",
@@ -562,16 +576,20 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<QuickChatResponse, 
     let mut created_map: HashMap<String, CreatedProjectSummary> = HashMap::new();
     let mut created_order: Vec<String> = Vec::new();
     let mut reply_text = String::new();
+    let mut sources_map: HashMap<String, GroundingSource> = HashMap::new();
+    let mut sources_order: Vec<String> = Vec::new();
+    let mut search_queries: Vec<String> = Vec::new();
 
     for _turn in 0..8 {
         let body = serde_json::json!({
             "systemInstruction": {
                 "parts": [{
-                    "text": "You are Aetheris Quick Chat on the Home Screen. You help users brainstorm or start new projects. PERMISSIONS: You have CREATE-ONLY permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list."
+                    "text": "You are Aetheris Quick Chat on the Home Screen. You help users brainstorm, look up current technical information via Google Search, or start new projects. PERMISSIONS: You have CREATE-ONLY workspace permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list. Use Google Search grounding whenever up-to-date web facts, documentation, or current information are needed."
                 }]
             },
             "contents": contents,
             "tools": tools,
+            "toolConfig": { "includeServerSideToolInvocations": true },
             "generationConfig": {
                 "thinkingConfig": { "thinkingLevel": "LOW" }
             }
@@ -590,6 +608,32 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<QuickChatResponse, 
         }
 
         let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        if let Some(queries) = json["candidates"][0]["groundingMetadata"]["webSearchQueries"].as_array() {
+            for q in queries {
+                if let Some(qs) = q.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !search_queries.iter().any(|existing| existing == qs) {
+                        search_queries.push(qs.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(chunks) = json["candidates"][0]["groundingMetadata"]["groundingChunks"].as_array() {
+            for chunk in chunks {
+                if let Some(uri) = chunk["web"]["uri"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let title = chunk["web"]["title"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(uri)
+                        .to_string();
+                    if !sources_map.contains_key(uri) {
+                        sources_order.push(uri.to_string());
+                        sources_map.insert(uri.to_string(), GroundingSource { title, uri: uri.to_string() });
+                    }
+                }
+            }
+        }
+
         let candidate_content = json["candidates"][0]["content"].clone();
         let parts = candidate_content["parts"].as_array().cloned().unwrap_or_default();
 
@@ -811,9 +855,16 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<QuickChatResponse, 
         .filter_map(|slug| created_map.remove(&slug))
         .collect();
 
+    let sources = sources_order
+        .into_iter()
+        .filter_map(|u| sources_map.remove(&u))
+        .collect();
+
     Ok(QuickChatResponse {
         reply: if reply_text.is_empty() { "Done.".into() } else { reply_text },
         created_projects,
+        sources,
+        search_queries,
     })
 }
 
@@ -1075,9 +1126,9 @@ async fn run_gemini_agent(
     };
 
     let system_prompt = if is_plan_mode {
-        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block."
+        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block."
     } else {
-        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets)."
+        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets)."
     };
 
     let mut contents: Vec<serde_json::Value> = history
@@ -1134,12 +1185,19 @@ async fn run_gemini_agent(
     let mut thought_start_ms: Option<u64> = None;
     let mut thought_end_ms: Option<u64> = None;
     let mut final_answer_text = String::new();
+    let mut sources_map: HashMap<String, GroundingSource> = HashMap::new();
+    let mut sources_order: Vec<String> = Vec::new();
+    let mut search_queries: Vec<String> = Vec::new();
 
     for turn in 0..max_turns {
         let body = serde_json::json!({
             "systemInstruction": { "parts": [{ "text": system_prompt }] },
             "contents": contents,
-            "tools": [{ "functionDeclarations": declarations }],
+            "tools": [
+                { "googleSearch": {} },
+                { "functionDeclarations": declarations }
+            ],
+            "toolConfig": { "includeServerSideToolInvocations": true },
             "generationConfig": {
                 "thinkingConfig": {
                     "thinkingLevel": thinking_level,
@@ -1205,6 +1263,41 @@ async fn run_gemini_agent(
                 let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
                     continue;
                 };
+
+                if let Some(queries) = json["candidates"][0]["groundingMetadata"]["webSearchQueries"].as_array() {
+                    for q in queries {
+                        if let Some(qs) = q.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                            if !search_queries.iter().any(|existing| existing == qs) {
+                                search_queries.push(qs.to_string());
+                                emit_agent_activity(
+                                    &app,
+                                    &format!("gsearch-{}-{}", turn, search_queries.len()),
+                                    "search",
+                                    &format!("Google Search: \"{}\"", qs.chars().take(48).collect::<String>()),
+                                    None,
+                                    "done",
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(chunks) = json["candidates"][0]["groundingMetadata"]["groundingChunks"].as_array() {
+                    for gchunk in chunks {
+                        if let Some(uri) = gchunk["web"]["uri"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                            let title = gchunk["web"]["title"]
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(uri)
+                                .to_string();
+                            if !sources_map.contains_key(uri) {
+                                sources_order.push(uri.to_string());
+                                sources_map.insert(uri.to_string(), GroundingSource { title, uri: uri.to_string() });
+                            }
+                        }
+                    }
+                }
+
                 let Some(parts) = json["candidates"][0]["content"]["parts"].as_array() else {
                     continue;
                 };
@@ -1232,6 +1325,8 @@ async fn run_gemini_agent(
                     if part.get("functionCall").is_some() {
                         model_parts.push(part.clone());
                         function_calls.push(part["functionCall"].clone());
+                    } else if part.get("toolCall").is_some() || part.get("toolResponse").is_some() {
+                        model_parts.push(part.clone());
                     } else if !text.is_empty() || part.get("thoughtSignature").is_some() {
                         if !text.is_empty() {
                             turn_text.push_str(text);
@@ -1239,6 +1334,8 @@ async fn run_gemini_agent(
                         let can_merge = if let Some(last) = model_parts.last() {
                             last.get("text").and_then(|v| v.as_str()).is_some()
                                 && last.get("functionCall").is_none()
+                                && last.get("toolCall").is_none()
+                                && last.get("toolResponse").is_none()
                                 && last.get("thoughtSignature").is_none()
                                 && part.get("thoughtSignature").is_none()
                         } else {
@@ -1252,6 +1349,8 @@ async fn run_gemini_agent(
                         } else {
                             model_parts.push(part.clone());
                         }
+                    } else {
+                        model_parts.push(part.clone());
                     }
                 }
             }
@@ -1697,12 +1796,19 @@ async fn run_gemini_agent(
         "Completed workspace analysis.".into()
     };
 
+    let sources = sources_order
+        .into_iter()
+        .filter_map(|u| sources_map.remove(&u))
+        .collect();
+
     Ok(AgentPlanResponse {
         summary,
         steps: Vec::new(),
         patches,
         thoughts: thoughts_accum.trim().to_string(),
         thinking_duration_ms,
+        sources,
+        search_queries,
     })
 }
 
