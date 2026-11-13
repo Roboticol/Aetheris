@@ -33,6 +33,14 @@ Install JS dependencies and build the native binary:
 ```bash
 npm install
 cargo install tauri-cli
+
+# Fast local desktop dev window (skips release LTO & bundling)
+cargo tauri dev
+
+# Release binary only (fast, skips AppImage/deb/rpm packaging)
+cargo tauri build --no-bundle
+
+# Full release installers (AppImage, .deb, .rpm)
 cargo tauri build
 ```
 

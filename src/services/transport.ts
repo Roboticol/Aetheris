@@ -101,10 +101,26 @@ export interface ActiveWorkspaceContext {
 }
 
 export async function listStarterWorkspaces(): Promise<WorkspaceSummary[]> {
-  const res = await fetch('/api/workspaces');
-  if (!res.ok) throw new Error('Failed to load starter workspaces');
-  const data = (await res.json()) as { workspaces: WorkspaceSummary[] };
-  return data.workspaces;
+  if (isTauriRuntime()) {
+    return [];
+  }
+  if (
+    typeof window !== 'undefined' &&
+    window.location.protocol !== 'http:' &&
+    window.location.protocol !== 'https:'
+  ) {
+    return [];
+  }
+  try {
+    const res = await fetch('/api/workspaces');
+    if (!res.ok) return [];
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/json')) return [];
+    const data = (await res.json()) as { workspaces?: WorkspaceSummary[] };
+    return Array.isArray(data.workspaces) ? data.workspaces : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchWorkspaceTree(ctx: ActiveWorkspaceContext): Promise<FileNode[]> {

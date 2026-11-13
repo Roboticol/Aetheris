@@ -156,20 +156,16 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     (async () => {
-      try {
-        const list = await listStarterWorkspaces();
-        if (!mounted) return;
+      if (isTauriRuntime()) return;
+      const list = await listStarterWorkspaces();
+      if (mounted) {
         setStarters(list);
-      } catch (err) {
-        if (mounted) {
-          showNotice('error', err instanceof Error ? err.message : 'Failed to initialize workspaces');
-        }
       }
     })();
     return () => {
       mounted = false;
     };
-  }, [showNotice]);
+  }, []);
 
   const openFile = useCallback(
     async (filePath: string, line?: number) => {
@@ -264,7 +260,7 @@ export default function App() {
           'plugin:dialog|open',
           { options: { directory: true, multiple: false } }
         );
-        if (!selected) return;
+        if (!selected || typeof selected !== 'string') return;
         const folderName = selected.split(/[/\\]/).filter(Boolean).pop() ?? selected;
         const nextCtx: ActiveWorkspaceContext = {
           source: 'tauri-native',
@@ -364,7 +360,7 @@ export default function App() {
           'plugin:dialog|open',
           { options: { directory: true, multiple: false, title: 'Choose parent directory' } }
         );
-        if (!parent) return;
+        if (!parent || typeof parent !== 'string') return;
         const createdPath = await createTauriWorkspaceFolder(parent, name, template);
         const folderName = createdPath.split(/[/\\]/).filter(Boolean).pop() ?? name;
         const nextCtx: ActiveWorkspaceContext = {

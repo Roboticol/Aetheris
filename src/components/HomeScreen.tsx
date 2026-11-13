@@ -262,34 +262,36 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </section>
 
           {/* Built-in & Created Workspaces */}
-          <section className="rounded-lg border border-[#272B38] bg-[#161922] p-4 space-y-2.5">
-            <h2 className="text-[13px] font-semibold text-[#E6E8EE]">Workspaces</h2>
-            <div className="divide-y divide-[#272B38]/70">
-              {availableWorkspaces.map((ws) => (
-                <button
-                  key={ws.id}
-                  type="button"
-                  onClick={() => onOpenWorkspaceSummary(ws)}
-                  className="flex w-full items-center justify-between gap-3 py-2 text-left hover:bg-[#1E222E]/60 px-1.5 -mx-1.5 rounded transition-colors"
-                >
-                  <div className="flex min-w-0 items-center gap-2.5">
-                    <Folder className="h-3.5 w-3.5 shrink-0 text-[#8B92A5]" />
-                    <div className="min-w-0">
-                      <div className="truncate text-[12.5px] font-medium text-[#E6E8EE]">
-                        {ws.name}
-                      </div>
-                      <div className="truncate text-[11.5px] text-[#8B92A5]">
-                        {ws.description}
+          {availableWorkspaces.length > 0 && (
+            <section className="rounded-lg border border-[#272B38] bg-[#161922] p-4 space-y-2.5">
+              <h2 className="text-[13px] font-semibold text-[#E6E8EE]">Workspaces</h2>
+              <div className="divide-y divide-[#272B38]/70">
+                {availableWorkspaces.map((ws) => (
+                  <button
+                    key={ws.id}
+                    type="button"
+                    onClick={() => onOpenWorkspaceSummary(ws)}
+                    className="flex w-full items-center justify-between gap-3 py-2 text-left hover:bg-[#1E222E]/60 px-1.5 -mx-1.5 rounded transition-colors"
+                  >
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <Folder className="h-3.5 w-3.5 shrink-0 text-[#8B92A5]" />
+                      <div className="min-w-0">
+                        <div className="truncate text-[12.5px] font-medium text-[#E6E8EE]">
+                          {ws.name}
+                        </div>
+                        <div className="truncate text-[11.5px] text-[#8B92A5]">
+                          {ws.description}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <span className="font-mono text-[11px] text-[#8B92A5] shrink-0">
-                    {ws.language}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
+                    <span className="font-mono text-[11px] text-[#8B92A5] shrink-0">
+                      {ws.language}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
 
         {/* Right Column: Home Companion Chat */}
