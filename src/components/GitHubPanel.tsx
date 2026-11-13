@@ -5,13 +5,14 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  CloudDownload,
   CloudUpload,
   FileCode2,
   GitBranch,
-  GitCommitHorizontal,
   Link2,
   Loader2,
   Minus,
+  MoreHorizontal,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -30,6 +31,10 @@ interface GitHubPanelProps {
   status: GitStatusSnapshot | null;
   isLoading: boolean;
   isBusy: boolean;
+  isFetching: boolean;
+  autoFetch: boolean;
+  lastFetchedAt: number | null;
+  onToggleAutoFetch: () => void;
   onRefresh: () => Promise<void>;
   onInitRepo: () => Promise<void>;
   onStage: (paths: string[], all?: boolean) => Promise<void>;
@@ -76,6 +81,10 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
   status,
   isLoading,
   isBusy,
+  isFetching,
+  autoFetch,
+  lastFetchedAt,
+  onToggleAutoFetch,
   onRefresh,
   onInitRepo,
   onStage,
@@ -99,6 +108,7 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
   const [commitsOpen, setCommitsOpen] = useState(true);
 
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const [newBranchName, setNewBranchName] = useState('');
 
@@ -279,8 +289,8 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* Source Control Toolbar */}
-      <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#272B38] px-2.5">
-        <div className="relative flex items-center gap-1 min-w-0">
+      <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-[#272B38] px-2.5">
+        <div className="relative flex flex-1 items-center gap-1 min-w-0">
           <button
             type="button"
             onClick={() => setBranchMenuOpen((p) => !p)}
@@ -363,40 +373,61 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
         </div>
 
         <div className="flex items-center gap-0.5 shrink-0">
-          <Tooltip label="Fetch from Remote">
+          <Tooltip
+            label={
+              status.remoteUrl
+                ? isFetching
+                  ? 'Fetching from remote...'
+                  : lastFetchedAt
+                    ? `Fetch from Remote (last: ${new Date(lastFetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`
+                    : 'Fetch from Remote'
+                : 'Connect a remote to fetch'
+            }
+          >
             <button
               type="button"
-              disabled={isBusy || !status.remoteUrl}
+              disabled={isBusy || isFetching || !status.remoteUrl}
               onClick={() => void onSync('fetch')}
               aria-label="Fetch"
-              className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
             >
-              <RefreshCw className={`h-3 w-3 ${isBusy ? 'animate-spin' : ''}`} />
+              {isFetching ? (
+                <Loader2 className="h-3 w-3 animate-spin text-[#818CF8]" />
+              ) : (
+                <CloudDownload className="h-3 w-3" />
+              )}
+              <span>Fetch</span>
             </button>
           </Tooltip>
-          <Tooltip label="Pull Changes">
+          <Tooltip label={status.behind > 0 ? `Pull (${status.behind} incoming)` : 'Pull'}>
             <button
               type="button"
               disabled={isBusy || !status.remoteUrl}
               onClick={() => void onSync('pull')}
               aria-label="Pull"
-              className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
+              className="relative rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
             >
               <ArrowDown className="h-3 w-3" />
+              {status.behind > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-[#818CF8]" />
+              )}
             </button>
           </Tooltip>
-          <Tooltip label="Push Commits">
+          <Tooltip label={status.ahead > 0 ? `Push (${status.ahead} outgoing)` : 'Push'}>
             <button
               type="button"
               disabled={isBusy || !status.remoteUrl}
               onClick={() => void onSync('push')}
               aria-label="Push"
-              className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
+              className="relative rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] disabled:opacity-35 transition-colors"
             >
               <ArrowUp className="h-3 w-3" />
+              {status.ahead > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              )}
             </button>
           </Tooltip>
-          <Tooltip label="Refresh Git Status">
+          <Tooltip label="Refresh">
             <button
               type="button"
               disabled={isLoading}
@@ -404,9 +435,122 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
               aria-label="Refresh Status"
               className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors"
             >
-              <GitCommitHorizontal className="h-3 w-3" />
+              <RefreshCw className={`h-3 w-3 ${isLoading ? 'animate-spin' : ''}`} />
             </button>
           </Tooltip>
+
+          <div className="relative">
+            <Tooltip label="Views and More Actions...">
+              <button
+                type="button"
+                onClick={() => setMoreMenuOpen((p) => !p)}
+                aria-label="More Source Control Actions"
+                className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors"
+              >
+                <MoreHorizontal className="h-3.5 w-3.5" />
+              </button>
+            </Tooltip>
+
+            {moreMenuOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setMoreMenuOpen(false)}
+                />
+                <div className="absolute right-0 top-full z-50 mt-1 w-52 rounded-lg border border-[#272B38] bg-[#161922] p-1 shadow-xl text-[11.5px]">
+                  <button
+                    type="button"
+                    disabled={isBusy || isFetching || !status.remoteUrl}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onSync('fetch');
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Fetch</span>
+                    <CloudDownload className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isBusy || !status.remoteUrl}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onSync('pull');
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Pull</span>
+                    <ArrowDown className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isBusy || !status.remoteUrl}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onSync('push');
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Push</span>
+                    <ArrowUp className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isBusy || !status.remoteUrl}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onSync('sync');
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Pull, Push (Sync)</span>
+                    <RefreshCw className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+
+                  <div className="my-1 h-px bg-[#272B38]" />
+
+                  <button
+                    type="button"
+                    disabled={isBusy || status.changes.length === 0}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onStage([], true);
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Stage All Changes</span>
+                    <Plus className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isBusy || status.staged.length === 0}
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      void onUnstage([], true);
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E] disabled:opacity-40"
+                  >
+                    <span>Unstage All Changes</span>
+                    <Minus className="h-3 w-3 text-[#8B92A5]" />
+                  </button>
+
+                  <div className="my-1 h-px bg-[#272B38]" />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onToggleAutoFetch();
+                      setMoreMenuOpen(false);
+                    }}
+                    className="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[#E6E8EE] hover:bg-[#1E222E]"
+                  >
+                    <span>Auto-Fetch (3m)</span>
+                    {autoFetch && <Check className="h-3 w-3 text-[#818CF8]" />}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -446,6 +590,13 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
                 <span className="truncate font-mono">
                   {status.remoteUrl ? formatRepoLabel(status.remoteUrl) : 'No GitHub remote'}
                 </span>
+                {status.remoteUrl && (status.ahead > 0 || status.behind > 0) && (
+                  <span className="shrink-0 font-mono text-[10.5px] text-[#818CF8] tabular-nums">
+                    {status.behind > 0 ? `↓${status.behind}` : ''}
+                    {status.behind > 0 && status.ahead > 0 ? ' ' : ''}
+                    {status.ahead > 0 ? `↑${status.ahead}` : ''}
+                  </span>
+                )}
               </div>
               <button
                 type="button"
@@ -475,23 +626,27 @@ export const GitHubPanel: React.FC<GitHubPanelProps> = ({
                 }
               }}
               placeholder="Message (Ctrl+Enter to commit)"
-              className="w-full resize-none rounded-md border border-[#272B38] bg-[#0F1117] px-2.5 py-1.5 pr-7 text-[12px] text-[#E6E8EE] placeholder-[#52596E] focus:border-[#6366F1] focus:outline-none"
+              className="block w-full resize-none rounded-md border border-[#272B38] bg-[#0F1117] px-2.5 py-1.5 pr-8 text-[12px] text-[#E6E8EE] placeholder-[#52596E] focus:border-[#6366F1] focus:outline-none"
             />
-            <Tooltip label="Generate commit message with AI">
-              <button
-                type="button"
-                disabled={isGeneratingMsg || totalChanges === 0}
-                onClick={() => void handleGenerateMessage()}
-                aria-label="Generate commit message"
-                className="absolute right-1.5 top-1.5 rounded p-1 text-[#818CF8] hover:bg-[#1E222E] disabled:opacity-35 transition-colors"
-              >
-                {isGeneratingMsg ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5" />
-                )}
-              </button>
-            </Tooltip>
+            {totalChanges > 0 && (
+              <div className="absolute right-1.5 top-1.5 z-10">
+                <Tooltip label="Generate Commit Message" side="left">
+                  <button
+                    type="button"
+                    disabled={isGeneratingMsg}
+                    onClick={() => void handleGenerateMessage()}
+                    aria-label="Generate commit message"
+                    className="rounded p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#818CF8] disabled:opacity-40 transition-colors"
+                  >
+                    {isGeneratingMsg ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#818CF8]" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                </Tooltip>
+              </div>
+            )}
           </div>
 
           {needsIdentity && (

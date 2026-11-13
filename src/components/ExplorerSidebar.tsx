@@ -43,6 +43,10 @@ interface ExplorerSidebarProps {
   gitStatus: GitStatusSnapshot | null;
   isGitLoading: boolean;
   isGitBusy: boolean;
+  isGitFetching: boolean;
+  gitAutoFetch: boolean;
+  lastGitFetchedAt: number | null;
+  onToggleGitAutoFetch: () => void;
   onGitRefresh: () => Promise<void>;
   onGitInitRepo: () => Promise<void>;
   onGitStage: (paths: string[], all?: boolean) => Promise<void>;
@@ -170,6 +174,10 @@ export const ExplorerSidebar: React.FC<ExplorerSidebarProps> = ({
   gitStatus,
   isGitLoading,
   isGitBusy,
+  isGitFetching,
+  gitAutoFetch,
+  lastGitFetchedAt,
+  onToggleGitAutoFetch,
   onGitRefresh,
   onGitInitRepo,
   onGitStage,
@@ -636,6 +644,10 @@ export const ExplorerSidebar: React.FC<ExplorerSidebarProps> = ({
               status={gitStatus}
               isLoading={isGitLoading}
               isBusy={isGitBusy}
+              isFetching={isGitFetching}
+              autoFetch={gitAutoFetch}
+              lastFetchedAt={lastGitFetchedAt}
+              onToggleAutoFetch={onToggleGitAutoFetch}
               onRefresh={onGitRefresh}
               onInitRepo={onGitInitRepo}
               onStage={onGitStage}

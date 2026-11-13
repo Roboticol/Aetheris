@@ -78,6 +78,17 @@ import { HomeScreen } from './components/HomeScreen';
 import { Tooltip } from './components/Tooltip';
 
 const PANEL_SIZES_KEY = 'aetheris.panelSizes';
+const GIT_AUTOFETCH_KEY = 'aetheris.gitAutoFetch';
+
+function loadGitAutoFetch(): boolean {
+  try {
+    const raw = localStorage.getItem(GIT_AUTOFETCH_KEY);
+    if (raw === null) return true;
+    return raw !== 'false';
+  } catch {
+    return true;
+  }
+}
 
 interface PanelSizes {
   leftWidth: number;
@@ -157,13 +168,33 @@ export default function App() {
   const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
   const [isGitLoading, setIsGitLoading] = useState(false);
   const [isGitBusy, setIsGitBusy] = useState(false);
+  const [isGitFetching, setIsGitFetching] = useState(false);
+  const [gitAutoFetch, setGitAutoFetch] = useState<boolean>(() => loadGitAutoFetch());
+  const [lastGitFetchedAt, setLastGitFetchedAt] = useState<number | null>(null);
   const [activeGitDiff, setActiveGitDiff] = useState<GitDiffPreview | null>(null);
 
   const agentAbortRef = useRef<AbortController | null>(null);
+  const autoFetchLockRef = useRef(false);
+  const lastAutoFetchMapRef = useRef<Map<string, number>>(new Map());
+  const activeWorkspaceKeyRef = useRef<string>(
+    getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id)
+  );
+  useEffect(() => {
+    activeWorkspaceKeyRef.current = getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id);
+  }, [workspaceCtx]);
+
   const followAiRef = useRef(followAi);
   useEffect(() => {
     followAiRef.current = followAi;
   }, [followAi]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(GIT_AUTOFETCH_KEY, String(gitAutoFetch));
+    } catch {
+      // Storage quota ignored
+    }
+  }, [gitAutoFetch]);
 
   // Home Quick Chat state (fresh session each time Home is opened)
   const [homeChatMessages, setHomeChatMessages] = useState<HomeChatMessage[]>([]);
@@ -254,6 +285,61 @@ export default function App() {
       setIsGitLoading(false);
     }
   }, []);
+
+  const runSilentGitFetch = useCallback(async (ctx: ActiveWorkspaceContext) => {
+    if (ctx.source === 'local-fs' || autoFetchLockRef.current) return;
+    const key = getWorkspaceSessionKey(ctx.source, ctx.id);
+    autoFetchLockRef.current = true;
+    setIsGitFetching(true);
+    try {
+      const snap = await syncGitRemote(ctx, 'fetch');
+      const now = Date.now();
+      lastAutoFetchMapRef.current.set(key, now);
+      if (activeWorkspaceKeyRef.current === key) {
+        setGitStatus(snap);
+        setLastGitFetchedAt(now);
+      }
+    } catch {
+      // Background auto-fetch fails silently if offline or unauthenticated
+    } finally {
+      autoFetchLockRef.current = false;
+      setIsGitFetching(false);
+    }
+  }, []);
+
+  // VS Code-style automatic background git fetch (on repo open, tab switch, and every 3 minutes)
+  useEffect(() => {
+    if (
+      view !== 'editor' ||
+      !gitAutoFetch ||
+      workspaceCtx.source === 'local-fs' ||
+      !gitStatus?.isRepo ||
+      !gitStatus?.remoteUrl
+    ) {
+      return;
+    }
+
+    const key = getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id);
+    const lastAt = lastAutoFetchMapRef.current.get(key) ?? 0;
+    const minAgeMs = sidebarTab === 'github' ? 30_000 : 180_000;
+    if (Date.now() - lastAt >= minAgeMs) {
+      void runSilentGitFetch(workspaceCtx);
+    }
+
+    const interval = setInterval(() => {
+      void runSilentGitFetch(workspaceCtx);
+    }, 180_000);
+
+    return () => clearInterval(interval);
+  }, [
+    view,
+    gitAutoFetch,
+    workspaceCtx,
+    gitStatus?.isRepo,
+    gitStatus?.remoteUrl,
+    sidebarTab,
+    runSilentGitFetch,
+  ]);
 
   const refreshWorkspace = useCallback(
     async (ctx: ActiveWorkspaceContext, openFirstFile = false) => {
@@ -437,6 +523,7 @@ export default function App() {
       setActiveDiffPatchId(null);
       setActiveGitDiff(null);
       setGitStatus(null);
+      setLastGitFetchedAt(lastAutoFetchMapRef.current.get(sessionKey) ?? null);
       setView('editor');
       setRecentWorkspaces(recordRecentWorkspace(recentEntry));
 
@@ -1207,13 +1294,22 @@ export default function App() {
 
   const handleGitSync = async (action: 'fetch' | 'pull' | 'push' | 'sync') => {
     setIsGitBusy(true);
+    if (action === 'fetch') setIsGitFetching(true);
     try {
       const snap = await syncGitRemote(workspaceCtx, action);
       setGitStatus(snap);
+      if (action === 'fetch') {
+        const now = Date.now();
+        const key = getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id);
+        lastAutoFetchMapRef.current.set(key, now);
+        setLastGitFetchedAt(now);
+      }
       await refreshWorkspace(workspaceCtx, false);
       const actionLabel =
         action === 'fetch'
-          ? 'Fetched from GitHub'
+          ? snap.behind > 0
+            ? `Fetched from GitHub (${snap.behind} incoming commit${snap.behind === 1 ? '' : 's'})`
+            : 'Fetched from GitHub — up to date'
           : action === 'pull'
             ? 'Pulled from GitHub'
             : action === 'push'
@@ -1224,6 +1320,7 @@ export default function App() {
       showNotice('error', err instanceof Error ? err.message : `Git ${action} failed`);
     } finally {
       setIsGitBusy(false);
+      if (action === 'fetch') setIsGitFetching(false);
     }
   };
 
@@ -1361,6 +1458,10 @@ export default function App() {
               gitStatus={gitStatus}
               isGitLoading={isGitLoading}
               isGitBusy={isGitBusy}
+              isGitFetching={isGitFetching}
+              gitAutoFetch={gitAutoFetch}
+              lastGitFetchedAt={lastGitFetchedAt}
+              onToggleGitAutoFetch={() => setGitAutoFetch((prev) => !prev)}
               onGitRefresh={() => refreshGitStatus(workspaceCtx)}
               onGitInitRepo={handleGitInitRepo}
               onGitStage={handleGitStage}
