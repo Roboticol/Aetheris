@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="c1-bg" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#131624" />
+      <stop offset="100%" stop-color="#090A10" />
+    </linearGradient>
+    <linearGradient id="c1-border" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.35" />
+      <stop offset="50%" stop-color="#818CF8" stop-opacity="0.15" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.06" />
+    </linearGradient>
+    <linearGradient id="c1-arch" x1="64" y1="20" x2="64" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC" />
+      <stop offset="55%" stop-color="#C7D2FE" />
+      <stop offset="100%" stop-color="#6366F1" />
+    </linearGradient>
+    <linearGradient id="c1-spark" x1="64" y1="68" x2="64" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDBA74" />
+      <stop offset="100%" stop-color="#E06D53" />
+    </linearGradient>
+  </defs>
+
+  <!-- App Icon Container -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#c1-bg)" stroke="url(#c1-border)" stroke-width="1.5" />
+
+  <!-- Levitating A-Arch -->
+  <path d="M 64 20
+           C 77 44, 94 78, 105 99
+           C 107.5 103.8, 103 108.5, 98 105.5
+           C 85 97.5, 77 46, 64 46
+           C 51 46, 43 97.5, 30 105.5
+           C 25 108.5, 20.5 103.8, 23 99
+           C 34 78, 51 44, 64 20 Z"
+        fill="url(#c1-arch)" />
+
+  <!-- Cursor-inspired Left Facet Highlight -->
+  <path d="M 64 20
+           C 51 44, 34 78, 23 99
+           C 20.5 103.8, 25 108.5, 30 105.5
+           C 43 97.5, 51 46, 64 46 Z"
+        fill="#FFFFFF" fill-opacity="0.22" />
+
+  <!-- Claude-inspired Warm Agentic Spark -->
+  <path d="M 64 68
+           Q 66.5 80.5 79 83
+           Q 66.5 85.5 64 98
+           Q 61.5 85.5 49 83
+           Q 61.5 80.5 64 68 Z"
+        fill="url(#c1-spark)" />
+</svg>
