@@ -58,10 +58,16 @@ export const TopBar: React.FC<TopBarProps> = ({
           <button
             type="button"
             onClick={onGoHome}
-            className="flex items-center gap-2 rounded-md px-1.5 py-1 text-[14px] font-bold tracking-tight text-[#E6E8EE] hover:bg-[#1E222E] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#6366F1]"
+            className="flex items-center gap-2 rounded-md px-1.5 py-1 text-[#E6E8EE] hover:bg-[#1E222E] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#6366F1]"
           >
-            <img src="/icon.svg" alt="" className="h-4 w-4 rounded-sm" />
-            <span>Aetheris</span>
+            <img
+              src="/icon.png"
+              alt=""
+              className="block h-[20px] w-[20px] shrink-0 rounded-[4px] object-cover"
+            />
+            <span className="text-[15px] font-bold leading-[20px] tracking-tight">
+              Aetheris
+            </span>
           </button>
         </Tooltip>
 

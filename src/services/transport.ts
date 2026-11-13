@@ -1,17 +1,19 @@
 import {
+  AgentActivityItem,
   AgentMode,
   AgentPatch,
   FileNode,
+  ModelEffort,
   RecentWorkspace,
   SearchHit,
   TerminalEntry,
-  ThinkingMode,
   WorkspaceSource,
   WorkspaceSummary,
 } from '../types/ide';
 
 interface TauriInternals {
   invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  transformCallback?: (callback: (payload: unknown) => void, once?: boolean) => number;
 }
 
 declare global {
@@ -30,6 +32,45 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
     throw new Error('Tauri IPC is not available in browser mode');
   }
   return window.__TAURI_INTERNALS__.invoke<T>(cmd, args);
+}
+
+async function listenTauriEvent<T>(
+  eventName: string,
+  handler: (payload: T) => void
+): Promise<() => void> {
+  const internals = window.__TAURI_INTERNALS__;
+  if (!internals?.invoke || !internals.transformCallback) {
+    return () => {};
+  }
+  try {
+    const callbackId = internals.transformCallback((evt: unknown) => {
+      const wrapped = evt as { payload?: T };
+      if (wrapped && wrapped.payload !== undefined) {
+        handler(wrapped.payload);
+      }
+    });
+    const eventId = await internals.invoke<number>('plugin:event|listen', {
+      event: eventName,
+      target: { kind: 'Any' },
+      handler: callbackId,
+    });
+    return () => {
+      void internals
+        .invoke('plugin:event|unlisten', { event: eventName, eventId })
+        .catch(() => {});
+    };
+  } catch {
+    return () => {};
+  }
+}
+
+export async function cancelTauriAgent(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    await tauriInvoke('cancel_gemini_agent');
+  } catch {
+    // Ignore cancellation race
+  }
 }
 
 const SKIP_DIRS = new Set(['node_modules', 'target', '.git', 'dist', '.next', '.turbo']);
@@ -409,20 +450,47 @@ export async function execWorkspaceCommand(
   };
 }
 
+export type AgentStreamEvent =
+  | { type: 'activity'; activity: AgentActivityItem }
+  | { type: 'thought'; delta: string };
+
 export async function runAgentPlan(params: {
   ctx: ActiveWorkspaceContext;
   prompt: string;
   activeFile: string | null;
   tree: FileNode[];
   openBuffers: Record<string, string>;
-  thinkingMode: ThinkingMode;
+  effort: ModelEffort;
   agentMode: AgentMode;
-}): Promise<{ summary: string; steps: string[]; patches: AgentPatch[] }> {
-  const { ctx, prompt, activeFile, tree, openBuffers, thinkingMode, agentMode } = params;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  signal?: AbortSignal;
+  onEvent?: (event: AgentStreamEvent) => void;
+}): Promise<{
+  summary: string;
+  steps: string[];
+  patches: AgentPatch[];
+  thoughts: string;
+  thinkingDurationMs: number;
+}> {
+  const {
+    ctx,
+    prompt,
+    activeFile,
+    tree,
+    openBuffers,
+    effort,
+    agentMode,
+    history,
+    signal,
+    onEvent,
+  } = params;
   const candidatePaths = flattenFilePaths(tree).slice(0, 24);
 
   const files: Array<{ path: string; content: string }> = [];
   for (const p of candidatePaths) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
     if (openBuffers[p] !== undefined) {
       files.push({ path: p, content: openBuffers[p] });
     } else {
@@ -439,42 +507,150 @@ export async function runAgentPlan(params: {
     summary: string;
     steps: string[];
     patches: Array<{ path: string; action: string; rationale: string; content: string }>;
+    thoughts: string;
+    thinkingDurationMs: number;
   };
 
   if (ctx.source === 'tauri-native') {
-    rawResult = await tauriInvoke('run_gemini_agent', {
-      prompt,
-      activeFile,
-      files,
-      thinkingMode,
-      agentMode,
+    const unlisten = await listenTauriEvent<AgentStreamEvent>('aetheris-agent-event', (evt) => {
+      onEvent?.(evt);
     });
+    const onAbort = () => {
+      void cancelTauriAgent();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      const tauriRes = await tauriInvoke<{
+        summary: string;
+        steps: string[];
+        patches: Array<{ path: string; action: string; rationale: string; content: string }>;
+        thoughts?: string;
+        thinkingDurationMs?: number;
+      }>('run_gemini_agent', {
+        prompt,
+        activeFile,
+        files,
+        effort,
+        agentMode,
+        history,
+      });
+
+      rawResult = {
+        summary: tauriRes.summary ?? 'Completed analysis.',
+        steps: tauriRes.steps ?? [],
+        patches: tauriRes.patches ?? [],
+        thoughts: tauriRes.thoughts ?? '',
+        thinkingDurationMs: tauriRes.thinkingDurationMs ?? 0,
+      };
+    } catch (err) {
+      if (signal?.aborted || (err instanceof Error && err.message === 'CANCELLED')) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      throw err;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      unlisten();
+    }
   } else {
     const res = await fetch('/api/agent/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal,
       body: JSON.stringify({
         prompt,
         activeFile,
         files,
-        thinkingMode,
+        effort,
         agentMode,
+        history,
       }),
     });
-    const data = (await res.json()) as {
-      summary?: string;
-      steps?: string[];
-      patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
-      error?: string;
-    };
+
     if (!res.ok) {
-      throw new Error(data.error ?? 'Agent failed to generate response');
+      let errMessage = 'Agent failed to generate response';
+      try {
+        const errData = (await res.json()) as { error?: string };
+        if (errData.error) errMessage = errData.error;
+      } catch {
+        // Ignore non-JSON error body
+      }
+      throw new Error(errMessage);
     }
-    rawResult = {
-      summary: data.summary ?? 'Completed analysis.',
-      steps: data.steps ?? [],
-      patches: data.patches ?? [],
-    };
+
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('application/x-ndjson') && res.body) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalResult: typeof rawResult | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIdx = buffer.indexOf('\n');
+        while (newlineIdx !== -1) {
+          const line = buffer.slice(0, newlineIdx).trim();
+          buffer = buffer.slice(newlineIdx + 1);
+
+          if (line) {
+            const evt = JSON.parse(line) as
+              | { type: 'activity'; activity: AgentActivityItem }
+              | { type: 'thought'; delta: string }
+              | {
+                  type: 'result';
+                  summary?: string;
+                  steps?: string[];
+                  patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
+                  thoughts?: string;
+                  thinkingDurationMs?: number;
+                }
+              | { type: 'error'; error?: string };
+
+            if (evt.type === 'activity' || evt.type === 'thought') {
+              onEvent?.(evt);
+            } else if (evt.type === 'error') {
+              throw new Error(evt.error ?? 'Agent failed during streaming');
+            } else if (evt.type === 'result') {
+              finalResult = {
+                summary: evt.summary ?? 'Completed analysis.',
+                steps: evt.steps ?? [],
+                patches: evt.patches ?? [],
+                thoughts: evt.thoughts ?? '',
+                thinkingDurationMs: evt.thinkingDurationMs ?? 0,
+              };
+            }
+          }
+
+          newlineIdx = buffer.indexOf('\n');
+        }
+      }
+
+      if (!finalResult) {
+        if (signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        throw new Error('Agent stream ended before returning a result');
+      }
+      rawResult = finalResult;
+    } else {
+      const data = (await res.json()) as {
+        summary?: string;
+        steps?: string[];
+        patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
+        thoughts?: string;
+        thinkingDurationMs?: number;
+      };
+      rawResult = {
+        summary: data.summary ?? 'Completed analysis.',
+        steps: data.steps ?? [],
+        patches: data.patches ?? [],
+        thoughts: data.thoughts ?? '',
+        thinkingDurationMs: data.thinkingDurationMs ?? 0,
+      };
+    }
   }
 
   const originalMap = new Map(files.map((f) => [f.path, f.content]));
@@ -504,6 +680,8 @@ export async function runAgentPlan(params: {
     summary: rawResult.summary,
     steps: rawResult.steps,
     patches,
+    thoughts: rawResult.thoughts,
+    thinkingDurationMs: rawResult.thinkingDurationMs,
   };
 }
 

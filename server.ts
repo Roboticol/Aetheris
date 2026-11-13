@@ -637,13 +637,35 @@ async function startServer() {
   });
 
   app.post('/api/agent/plan', async (req, res) => {
+    const abortController = new AbortController();
+    let clientClosed = false;
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+        abortController.abort();
+      }
+    });
+
+    const emitEvent = (payload: Record<string, unknown>) => {
+      if (clientClosed || res.writableEnded) return;
+      res.write(`${JSON.stringify(payload)}\n`);
+    };
+
     try {
-      const { prompt, activeFile, files, thinkingMode, agentMode } = req.body as {
+      const {
+        prompt,
+        activeFile,
+        files,
+        effort,
+        agentMode,
+        history,
+      } = req.body as {
         prompt: string;
         activeFile?: string | null;
         files: Array<{ path: string; content: string }>;
-        thinkingMode?: 'fast' | 'deep';
+        effort?: 'low' | 'medium' | 'high' | 'xhigh';
         agentMode?: 'plan' | 'action';
+        history?: Array<{ role: 'user' | 'assistant'; content: string }>;
       };
 
       if (!prompt || !prompt.trim()) {
@@ -651,25 +673,86 @@ async function startServer() {
         return;
       }
 
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const startedAt = Date.now();
       const isPlanMode = agentMode === 'plan';
       const ai = getGeminiClient();
-      const contextFiles = (files ?? [])
-        .slice(0, 28)
+      const workspaceFiles = (files ?? []).slice(0, 28);
+
+      // Emit initial inspection activity (Follow AI can track active/indexed files)
+      const inspectedFiles = activeFile
+        ? [activeFile, ...workspaceFiles.map((f) => f.path).filter((p) => p !== activeFile)].slice(0, 4)
+        : workspaceFiles.map((f) => f.path).slice(0, 3);
+
+      for (const filePath of inspectedFiles) {
+        emitEvent({
+          type: 'activity',
+          activity: {
+            id: `read-${filePath}`,
+            kind: 'read',
+            label: `Inspecting ${filePath}`,
+            filePath,
+            status: 'done',
+          },
+        });
+      }
+
+      emitEvent({
+        type: 'activity',
+        activity: {
+          id: 'phase-think',
+          kind: 'think',
+          label: isPlanMode ? 'Analyzing architecture & plan' : 'Reasoning over workspace edits',
+          status: 'running',
+        },
+      });
+
+      const contextFiles = workspaceFiles
         .map((f) => `--- FILE: ${f.path} ---\n${f.content.slice(0, 18000)}`)
         .join('\n\n');
 
-      const thinkingLevel = thinkingMode === 'deep' ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
+      const thinkingLevel =
+        effort === 'xhigh'
+          ? ThinkingLevel.XHIGH
+          : effort === 'high'
+            ? ThinkingLevel.HIGH
+            : effort === 'low'
+              ? ThinkingLevel.LOW
+              : ThinkingLevel.MEDIUM;
 
       const systemInstruction = isPlanMode
         ? 'You are Aetheris in PLAN MODE (read-only architectural and implementation planning). Inspect the provided workspace files carefully and produce a concrete, step-by-step engineering plan explaining which files, functions, and data flows should change and why. Do NOT emit file edits in Plan Mode: always return an empty patches array [].'
         : 'You are Aetheris in ACTION MODE (autonomous multi-file coding). Inspect the provided workspace files carefully. Respond with a concise engineering summary, clear verification/inspection steps you took, and structured multi-file patches. Whenever creating or modifying a file, provide the COMPLETE updated file content (never truncate with ellipses or placeholders).';
 
-      const response = await ai.models.generateContent({
+      const priorTurns = (history ?? [])
+        .filter((h) => h.content && h.content.trim())
+        .slice(-10)
+        .map((h) => ({
+          role: h.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: h.content.slice(0, 4000) }],
+        }));
+
+      const currentTurnText = `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (generate patches)'}\nActive editor file: ${activeFile ?? 'none'}\n\nUser request:\n${prompt}\n\nWorkspace context:\n${contextFiles}`;
+
+      const contents = [
+        ...priorTurns,
+        { role: 'user', parts: [{ text: currentTurnText }] },
+      ];
+
+      const stream = await ai.models.generateContentStream({
         model: 'gemini-4-hydrogen',
-        contents: `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (generate patches)'}\nActive editor file: ${activeFile ?? 'none'}\n\nUser request:\n${prompt}\n\nWorkspace context:\n${contextFiles}`,
+        contents,
         config: {
+          abortSignal: abortController.signal,
           systemInstruction,
-          thinkingConfig: { thinkingLevel },
+          thinkingConfig: {
+            thinkingLevel,
+            includeThoughts: true,
+          },
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -706,21 +789,134 @@ async function startServer() {
         },
       });
 
-      const raw = (response.text ?? '{}').trim();
-      const parsed = JSON.parse(raw) as {
+      let rawAnswer = '';
+      let thoughtsAccum = '';
+      let thoughtStartMs: number | null = null;
+      let thoughtEndMs: number | null = null;
+      let emittedDrafting = false;
+      const seenEditPaths = new Set<string>();
+
+      for await (const chunk of stream) {
+        if (clientClosed || abortController.signal.aborted) break;
+
+        const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+        for (const part of parts) {
+          const textPiece = typeof part.text === 'string' ? part.text : '';
+          if (!textPiece) continue;
+
+          if ((part as { thought?: boolean }).thought) {
+            if (thoughtStartMs === null) thoughtStartMs = Date.now();
+            thoughtEndMs = Date.now();
+            thoughtsAccum += textPiece;
+            emitEvent({ type: 'thought', delta: textPiece });
+          } else {
+            if (!emittedDrafting) {
+              emittedDrafting = true;
+              if (thoughtStartMs !== null && thoughtEndMs === null) {
+                thoughtEndMs = Date.now();
+              }
+              emitEvent({
+                type: 'activity',
+                activity: {
+                  id: 'phase-think',
+                  kind: 'think',
+                  label: isPlanMode ? 'Analyzed architecture & plan' : 'Finished reasoning',
+                  status: 'done',
+                },
+              });
+              emitEvent({
+                type: 'activity',
+                activity: {
+                  id: 'phase-draft',
+                  kind: isPlanMode ? 'plan' : 'edit',
+                  label: isPlanMode ? 'Writing step-by-step plan' : 'Drafting workspace patches',
+                  status: 'running',
+                },
+              });
+            }
+
+            rawAnswer += textPiece;
+
+            if (!isPlanMode) {
+              const pathMatches = rawAnswer.matchAll(/"path"\s*:\s*"([^"\\]+)"/g);
+              for (const m of pathMatches) {
+                const patchedPath = m[1];
+                if (patchedPath && !seenEditPaths.has(patchedPath)) {
+                  seenEditPaths.add(patchedPath);
+                  emitEvent({
+                    type: 'activity',
+                    activity: {
+                      id: `edit-${patchedPath}`,
+                      kind: 'edit',
+                      label: `Preparing edit -> ${patchedPath}`,
+                      filePath: patchedPath,
+                      status: 'done',
+                    },
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (clientClosed || abortController.signal.aborted) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
+
+      const parsed = JSON.parse((rawAnswer || '{}').trim()) as {
         summary?: string;
         steps?: string[];
         patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
       };
 
-      res.json({
+      const thinkingDurationMs =
+        thoughtStartMs !== null
+          ? Math.max(200, (thoughtEndMs ?? Date.now()) - thoughtStartMs)
+          : Date.now() - startedAt;
+
+      emitEvent({
+        type: 'activity',
+        activity: {
+          id: 'phase-think',
+          kind: 'think',
+          label: isPlanMode ? 'Analyzed architecture & plan' : 'Completed reasoning',
+          status: 'done',
+        },
+      });
+      emitEvent({
+        type: 'activity',
+        activity: {
+          id: 'phase-draft',
+          kind: 'done',
+          label: isPlanMode ? 'Plan ready' : `Prepared ${Array.isArray(parsed.patches) ? parsed.patches.length : 0} file change(s)`,
+          status: 'done',
+        },
+      });
+
+      emitEvent({
+        type: 'result',
         summary: parsed.summary ?? 'Completed workspace analysis.',
         steps: Array.isArray(parsed.steps) ? parsed.steps : [],
         patches: isPlanMode ? [] : Array.isArray(parsed.patches) ? parsed.patches : [],
+        thoughts: thoughtsAccum.trim(),
+        thinkingDurationMs,
       });
+
+      if (!res.writableEnded) res.end();
     } catch (err) {
+      if (clientClosed || abortController.signal.aborted) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
       const message = err instanceof Error ? err.message : 'Agent request failed';
-      res.status(500).json({ error: message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: message });
+      } else {
+        emitEvent({ type: 'error', error: message });
+        if (!res.writableEnded) res.end();
+      }
     }
   });
 

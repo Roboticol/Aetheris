@@ -94,9 +94,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       >
         <div className="flex items-center gap-3 mb-4">
           <img
-            src="/icon.svg"
+            src="/icon.png"
             alt="Aetheris logo"
-            className="h-9 w-9 rounded-lg object-contain"
+            className="h-9 w-9 rounded-lg object-cover"
           />
           <h1 className="text-2xl font-bold tracking-tight text-[#E6E8EE]">
             Aetheris

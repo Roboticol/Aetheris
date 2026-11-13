@@ -1,11 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Eye,
   FileCode2,
   FolderOpen,
   Save,
   X,
 } from 'lucide-react';
 import {
+  AgentActivityItem,
   AgentMessage,
   AgentMode,
   AgentPatch,
@@ -13,14 +15,15 @@ import {
   EditorTab,
   FileNode,
   HomeChatMessage,
+  ModelEffort,
   RecentWorkspace,
   SearchHit,
   TerminalEntry,
-  ThinkingMode,
   WorkspaceSummary,
 } from './types/ide';
 import {
   ActiveWorkspaceContext,
+  cancelTauriAgent,
   createServerWorkspaceFolder,
   createTauriWorkspaceFolder,
   createWorkspaceEntry,
@@ -43,6 +46,14 @@ import {
   sendHomeChat,
   writeWorkspaceFile,
 } from './services/transport';
+import {
+  clearWorkspaceSessionMessages,
+  getWorkspaceSessionKey,
+  loadHomeChatHistory,
+  loadWorkspaceSession,
+  saveHomeChatHistory,
+  saveWorkspaceSession,
+} from './services/chatStorage';
 import { TopBar } from './components/TopBar';
 import { ExplorerSidebar } from './components/ExplorerSidebar';
 import { CodeEditor } from './components/CodeEditor';
@@ -88,13 +99,22 @@ export default function App() {
 
   // Agent & Diff state
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('fast');
+  const [effort, setEffort] = useState<ModelEffort>('medium');
   const [agentMode, setAgentMode] = useState<AgentMode>('action');
+  const [followAi, setFollowAi] = useState<boolean>(true);
   const [isAgentBusy, setIsAgentBusy] = useState(false);
   const [activeDiffPatchId, setActiveDiffPatchId] = useState<string | null>(null);
+  const [hydratedWorkspaceKey, setHydratedWorkspaceKey] = useState<string | null>(null);
+
+  const agentAbortRef = useRef<AbortController | null>(null);
+  const followAiRef = useRef(followAi);
+  useEffect(() => {
+    followAiRef.current = followAi;
+  }, [followAi]);
 
   // Home smalltalk chat state
   const [homeChatMessages, setHomeChatMessages] = useState<HomeChatMessage[]>([]);
+  const [homeChatHydrated, setHomeChatHydrated] = useState(false);
   const [isHomeChatBusy, setIsHomeChatBusy] = useState(false);
 
   // Terminal state
@@ -152,10 +172,15 @@ export default function App() {
     [showNotice]
   );
 
-  // Boot: load available workspaces (stays on HomeScreen until user picks/opens one)
+  // Boot: load available workspaces + saved home chat history
   useEffect(() => {
     let mounted = true;
     (async () => {
+      const savedHome = await loadHomeChatHistory();
+      if (mounted) {
+        setHomeChatMessages(savedHome);
+        setHomeChatHydrated(true);
+      }
       if (isTauriRuntime()) return;
       const list = await listStarterWorkspaces();
       if (mounted) {
@@ -166,6 +191,31 @@ export default function App() {
       mounted = false;
     };
   }, []);
+
+  // Persist Home Quick Chat automatically
+  useEffect(() => {
+    if (!homeChatHydrated) return;
+    void saveHomeChatHistory(homeChatMessages);
+  }, [homeChatMessages, homeChatHydrated]);
+
+  // Persist per-workspace conversation & agent settings automatically
+  useEffect(() => {
+    const currentKey = getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id);
+    if (hydratedWorkspaceKey !== currentKey) return;
+
+    const timer = setTimeout(() => {
+      void saveWorkspaceSession({
+        workspaceKey: currentKey,
+        messages: agentMessages,
+        agentMode,
+        effort,
+        followAi,
+        updatedAt: Date.now(),
+      });
+    }, isAgentBusy ? 400 : 80);
+
+    return () => clearTimeout(timer);
+  }, [agentMessages, agentMode, effort, followAi, isAgentBusy, workspaceCtx, hydratedWorkspaceKey]);
 
   const openFile = useCallback(
     async (filePath: string, line?: number) => {
@@ -253,6 +303,39 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSaveTab]);
 
+  const activateWorkspace = useCallback(
+    async (nextCtx: ActiveWorkspaceContext, recentEntry: RecentWorkspace) => {
+      if (agentAbortRef.current) {
+        agentAbortRef.current.abort();
+        agentAbortRef.current = null;
+        void cancelTauriAgent();
+      }
+      setIsAgentBusy(false);
+
+      const sessionKey = getWorkspaceSessionKey(nextCtx.source, nextCtx.id);
+      setHydratedWorkspaceKey(null);
+      setWorkspaceCtx(nextCtx);
+      setTerminalEntries([]);
+      setActiveDiffPatchId(null);
+      setView('editor');
+      setRecentWorkspaces(recordRecentWorkspace(recentEntry));
+
+      const saved = await loadWorkspaceSession(sessionKey);
+      if (saved) {
+        setAgentMessages(saved.messages);
+        setAgentMode(saved.agentMode);
+        setEffort(saved.effort);
+        setFollowAi(saved.followAi);
+      } else {
+        setAgentMessages([]);
+      }
+      setHydratedWorkspaceKey(sessionKey);
+
+      await refreshWorkspace(nextCtx, true);
+    },
+    [refreshWorkspace]
+  );
+
   const handleOpenLocalFolder = async () => {
     try {
       if (isTauriRuntime()) {
@@ -268,21 +351,13 @@ export default function App() {
           name: folderName,
           nativeRoot: selected,
         };
-        setWorkspaceCtx(nextCtx);
-        setAgentMessages([]);
-        setTerminalEntries([]);
-        setActiveDiffPatchId(null);
-        setView('editor');
-        setRecentWorkspaces(
-          recordRecentWorkspace({
-            id: selected,
-            name: folderName,
-            source: 'tauri-native',
-            nativeRoot: selected,
-            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          })
-        );
-        await refreshWorkspace(nextCtx, true);
+        await activateWorkspace(nextCtx, {
+          id: selected,
+          name: folderName,
+          source: 'tauri-native',
+          nativeRoot: selected,
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        });
         return;
       }
 
@@ -302,20 +377,12 @@ export default function App() {
         localDirHandle: dirHandle,
       };
       await saveLocalDirHandle(dirHandle.name, dirHandle);
-      setWorkspaceCtx(nextCtx);
-      setAgentMessages([]);
-      setTerminalEntries([]);
-      setActiveDiffPatchId(null);
-      setView('editor');
-      setRecentWorkspaces(
-        recordRecentWorkspace({
-          id: dirHandle.name,
-          name: dirHandle.name,
-          source: 'local-fs',
-          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        })
-      );
-      await refreshWorkspace(nextCtx, true);
+      await activateWorkspace(nextCtx, {
+        id: dirHandle.name,
+        name: dirHandle.name,
+        source: 'local-fs',
+        lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      });
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return;
       showNotice(
@@ -334,20 +401,12 @@ export default function App() {
       id,
       name: starter?.name ?? id,
     };
-    setWorkspaceCtx(nextCtx);
-    setAgentMessages([]);
-    setTerminalEntries([]);
-    setActiveDiffPatchId(null);
-    setView('editor');
-    setRecentWorkspaces(
-      recordRecentWorkspace({
-        id,
-        name: nextCtx.name,
-        source: 'starter',
-        lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      })
-    );
-    await refreshWorkspace(nextCtx, true);
+    await activateWorkspace(nextCtx, {
+      id,
+      name: nextCtx.name,
+      source: 'starter',
+      lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    });
   };
 
   const handleCreateNewFolder = async (
@@ -369,21 +428,13 @@ export default function App() {
           name: folderName,
           nativeRoot: createdPath,
         };
-        setWorkspaceCtx(nextCtx);
-        setAgentMessages([]);
-        setTerminalEntries([]);
-        setActiveDiffPatchId(null);
-        setView('editor');
-        setRecentWorkspaces(
-          recordRecentWorkspace({
-            id: createdPath,
-            name: folderName,
-            source: 'tauri-native',
-            nativeRoot: createdPath,
-            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          })
-        );
-        await refreshWorkspace(nextCtx, true);
+        await activateWorkspace(nextCtx, {
+          id: createdPath,
+          name: folderName,
+          source: 'tauri-native',
+          nativeRoot: createdPath,
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        });
         return;
       }
 
@@ -395,20 +446,12 @@ export default function App() {
         id: created.id,
         name: created.name,
       };
-      setWorkspaceCtx(nextCtx);
-      setAgentMessages([]);
-      setTerminalEntries([]);
-      setActiveDiffPatchId(null);
-      setView('editor');
-      setRecentWorkspaces(
-        recordRecentWorkspace({
-          id: created.id,
-          name: created.name,
-          source: 'starter',
-          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        })
-      );
-      await refreshWorkspace(nextCtx, true);
+      await activateWorkspace(nextCtx, {
+        id: created.id,
+        name: created.name,
+        source: 'starter',
+        lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      });
     } catch (err) {
       showNotice('error', err instanceof Error ? err.message : 'Failed to create folder');
     }
@@ -423,18 +466,10 @@ export default function App() {
           name: item.name,
           nativeRoot: item.nativeRoot,
         };
-        setWorkspaceCtx(nextCtx);
-        setAgentMessages([]);
-        setTerminalEntries([]);
-        setActiveDiffPatchId(null);
-        setView('editor');
-        setRecentWorkspaces(
-          recordRecentWorkspace({
-            ...item,
-            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          })
-        );
-        await refreshWorkspace(nextCtx, true);
+        await activateWorkspace(nextCtx, {
+          ...item,
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        });
         return;
       }
 
@@ -461,18 +496,10 @@ export default function App() {
           name: item.name,
           localDirHandle: handle,
         };
-        setWorkspaceCtx(nextCtx);
-        setAgentMessages([]);
-        setTerminalEntries([]);
-        setActiveDiffPatchId(null);
-        setView('editor');
-        setRecentWorkspaces(
-          recordRecentWorkspace({
-            ...item,
-            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          })
-        );
-        await refreshWorkspace(nextCtx, true);
+        await activateWorkspace(nextCtx, {
+          ...item,
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        });
         return;
       }
 
@@ -614,6 +641,14 @@ export default function App() {
     }
   };
 
+  const handleCancelAgent = useCallback(() => {
+    if (agentAbortRef.current) {
+      agentAbortRef.current.abort();
+      agentAbortRef.current = null;
+    }
+    void cancelTauriAgent();
+  }, []);
+
   const handleRunAgent = async (prompt: string, overrideMode?: AgentMode) => {
     const effectiveMode = overrideMode ?? agentMode;
     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -621,11 +656,41 @@ export default function App() {
       id: `user-${Date.now()}`,
       role: 'user',
       mode: effectiveMode,
+      effort,
       content: prompt,
       timestamp: timeStr,
     };
-    setAgentMessages((prev) => [...prev, userMsg]);
+    const streamId = `asst-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const placeholderMsg: AgentMessage = {
+      id: streamId,
+      role: 'assistant',
+      mode: effectiveMode,
+      effort,
+      content: '',
+      thoughts: '',
+      activity: [],
+      timestamp: timeStr,
+      isStreaming: true,
+    };
+
+    const priorHistory = agentMessages
+      .filter((m) => !m.error && !m.cancelled && m.content.trim().length > 0)
+      .slice(-10)
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    setAgentMessages((prev) => [...prev, userMsg, placeholderMsg]);
     setIsAgentBusy(true);
+
+    const abortController = new AbortController();
+    agentAbortRef.current = abortController;
+
+    const knownPaths = new Set(flattenFilePaths(tree));
+
+    const upsertActivity = (prev: AgentActivityItem[], incoming: AgentActivityItem): AgentActivityItem[] => {
+      const idx = prev.findIndex((a) => a.id === incoming.id);
+      if (idx === -1) return [...prev, incoming];
+      return prev.map((a, i) => (i === idx ? incoming : a));
+    };
 
     try {
       const openBuffers: Record<string, string> = {};
@@ -639,37 +704,99 @@ export default function App() {
         activeFile: activeTabPath,
         tree,
         openBuffers,
-        thinkingMode,
+        effort,
         agentMode: effectiveMode,
+        history: priorHistory,
+        signal: abortController.signal,
+        onEvent: (evt) => {
+          if (evt.type === 'thought') {
+            setAgentMessages((prev) =>
+              prev.map((m) =>
+                m.id === streamId ? { ...m, thoughts: `${m.thoughts ?? ''}${evt.delta}` } : m
+              )
+            );
+          } else if (evt.type === 'activity') {
+            setAgentMessages((prev) =>
+              prev.map((m) =>
+                m.id === streamId
+                  ? { ...m, activity: upsertActivity(m.activity ?? [], evt.activity) }
+                  : m
+              )
+            );
+            if (
+              followAiRef.current &&
+              evt.activity.filePath &&
+              knownPaths.has(evt.activity.filePath)
+            ) {
+              void openFile(evt.activity.filePath);
+            }
+          }
+        },
       });
 
-      const assistantMsg: AgentMessage = {
-        id: `asst-${Date.now()}`,
-        role: 'assistant',
-        mode: effectiveMode,
-        content: result.summary,
-        steps: result.steps,
-        patches: result.patches,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
+      setAgentMessages((prev) =>
+        prev.map((m) =>
+          m.id === streamId
+            ? {
+                ...m,
+                content: result.summary,
+                steps: result.steps,
+                patches: result.patches,
+                thoughts: result.thoughts || m.thoughts,
+                thinkingDurationMs: result.thinkingDurationMs,
+                isStreaming: false,
+                activity: (m.activity ?? []).map((a) => ({ ...a, status: 'done' })),
+                timestamp: new Date().toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                }),
+              }
+            : m
+        )
+      );
 
-      setAgentMessages((prev) => [...prev, assistantMsg]);
-      if (result.patches.length > 0) {
+      if (result.patches.length > 0 && followAiRef.current) {
         setActiveDiffPatchId(result.patches[0].id);
       }
     } catch (err) {
-      const errorText = err instanceof Error ? err.message : 'Agent request failed';
-      setAgentMessages((prev) => [
-        ...prev,
-        {
-          id: `err-${Date.now()}`,
-          role: 'assistant',
-          content: '',
-          error: errorText,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        },
-      ]);
+      const isAbort =
+        abortController.signal.aborted ||
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && (err.name === 'AbortError' || err.message === 'CANCELLED'));
+
+      if (isAbort) {
+        setAgentMessages((prev) =>
+          prev.map((m) =>
+            m.id === streamId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  cancelled: true,
+                  content: m.content || 'Cancelled by user.',
+                  activity: (m.activity ?? []).map((a) => ({ ...a, status: 'done' })),
+                }
+              : m
+          )
+        );
+      } else {
+        const errorText = err instanceof Error ? err.message : 'Agent request failed';
+        setAgentMessages((prev) =>
+          prev.map((m) =>
+            m.id === streamId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  error: errorText,
+                  activity: (m.activity ?? []).map((a) => ({ ...a, status: 'done' })),
+                }
+              : m
+          )
+        );
+      }
     } finally {
+      if (agentAbortRef.current === abortController) {
+        agentAbortRef.current = null;
+      }
       setIsAgentBusy(false);
     }
   };
@@ -921,25 +1048,33 @@ export default function App() {
               )}
             </div>
 
-            {activeTab && !activeDiffPatch && (
-              <div className="flex items-center gap-3 px-3 text-[11.5px] text-[#8B92A5] shrink-0">
-                <span className="hidden md:inline font-mono tabular-nums">
-                  Ln {cursor.line}, Col {cursor.col}
+            <div className="flex items-center gap-3 px-3 text-[11.5px] text-[#8B92A5] shrink-0">
+              {isAgentBusy && followAi && (
+                <span className="flex items-center gap-1 text-[11px] font-medium text-[#818CF8]">
+                  <Eye className="h-3 w-3" />
+                  <span className="hidden sm:inline">Following AI</span>
                 </span>
-                {activeTab.isDirty && (
-                  <Tooltip label="Save File" shortcut="Ctrl+S">
-                    <button
-                      type="button"
-                      onClick={() => handleSaveTab(activeTab.path)}
-                      className="flex items-center gap-1 rounded bg-[#6366F1] px-2 py-0.5 text-[11px] font-medium text-white hover:bg-[#818CF8] transition-colors"
-                    >
-                      <Save className="h-3 w-3" />
-                      <span>Save</span>
-                    </button>
-                  </Tooltip>
-                )}
-              </div>
-            )}
+              )}
+              {activeTab && !activeDiffPatch && (
+                <>
+                  <span className="hidden md:inline font-mono tabular-nums">
+                    Ln {cursor.line}, Col {cursor.col}
+                  </span>
+                  {activeTab.isDirty && (
+                    <Tooltip label="Save File" shortcut="Ctrl+S">
+                      <button
+                        type="button"
+                        onClick={() => handleSaveTab(activeTab.path)}
+                        className="flex items-center gap-1 rounded bg-[#6366F1] px-2 py-0.5 text-[11px] font-medium text-white hover:bg-[#818CF8] transition-colors"
+                      >
+                        <Save className="h-3 w-3" />
+                        <span>Save</span>
+                      </button>
+                    </Tooltip>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
           {/* Active Viewport: DiffViewer OR CodeEditor OR Empty State */}
@@ -1021,12 +1156,16 @@ export default function App() {
             messages={agentMessages}
             activeFilePath={activeTabPath}
             workspaceFileCount={allFilePaths.length}
-            thinkingMode={thinkingMode}
+            effort={effort}
             agentMode={agentMode}
+            followAi={followAi}
             isBusy={isAgentBusy}
-            onThinkingModeChange={setThinkingMode}
+            onEffortChange={setEffort}
             onAgentModeChange={setAgentMode}
+            onFollowAiChange={setFollowAi}
             onSendPrompt={handleRunAgent}
+            onCancelPrompt={handleCancelAgent}
+            onOpenFile={(p) => void openFile(p)}
             onInspectPatch={(patch) => setActiveDiffPatchId(patch.id)}
             onAcceptPatch={handleAcceptPatch}
             onRejectPatch={handleRejectPatch}
@@ -1034,6 +1173,9 @@ export default function App() {
             onClearHistory={() => {
               setAgentMessages([]);
               setActiveDiffPatchId(null);
+              void clearWorkspaceSessionMessages(
+                getWorkspaceSessionKey(workspaceCtx.source, workspaceCtx.id)
+              );
             }}
           />
         )}

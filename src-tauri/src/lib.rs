@@ -4,7 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use tauri::Manager;
+use std::sync::Arc;
+use std::time::Instant;
+use tauri::{Emitter, Manager};
+use tokio::sync::{oneshot, Mutex};
+
+#[derive(Default)]
+struct AgentCancelState {
+    tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -55,11 +63,67 @@ pub struct AgentPlanResponse {
     pub summary: String,
     pub steps: Vec<String>,
     pub patches: Vec<AgentPatch>,
+    pub thoughts: String,
+    pub thinking_duration_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct LocalConfig {
     gemini_api_key: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_desktop_integration() {
+    let Some(data_dir) = dirs::data_local_dir() else {
+        return;
+    };
+
+    let icon_png_dir = data_dir
+        .join("icons")
+        .join("hicolor")
+        .join("128x128")
+        .join("apps");
+    let icon_svg_dir = data_dir
+        .join("icons")
+        .join("hicolor")
+        .join("scalable")
+        .join("apps");
+    let apps_dir = data_dir.join("applications");
+
+    let _ = fs::create_dir_all(&icon_png_dir);
+    let _ = fs::create_dir_all(&icon_svg_dir);
+    let _ = fs::create_dir_all(&apps_dir);
+
+    let png_path = icon_png_dir.join("aetheris.png");
+    let svg_path = icon_svg_dir.join("aetheris.svg");
+
+    let png_bytes = include_bytes!("../icons/icon.png");
+    let svg_bytes = include_bytes!("../icons/icon.svg");
+    let _ = fs::write(&png_path, png_bytes);
+    let _ = fs::write(&svg_path, svg_bytes);
+
+    let exe_cmd = std::env::current_exe()
+        .ok()
+        .map(|p| format!("{} %F", p.to_string_lossy()))
+        .unwrap_or_else(|| "aetheris %F".to_string());
+
+    let desktop_entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Aetheris\nComment=Lightweight Rust-native agentic coding IDE\nExec={}\nIcon={}\nTerminal=false\nCategories=Development;IDE;TextEditor;\nStartupNotify=true\nStartupWMClass=aetheris\n",
+        exe_cmd,
+        png_path.to_string_lossy()
+    );
+
+    // Cover both binary prgname (`aetheris`) and bundle identifier (`dev.aetheris.ide`) on Wayland taskbars
+    let _ = fs::write(apps_dir.join("aetheris.desktop"), &desktop_entry);
+    let _ = fs::write(apps_dir.join("dev.aetheris.ide.desktop"), &desktop_entry);
+
+    let hicolor_root = data_dir.join("icons").join("hicolor");
+    let _ = Command::new("gtk-update-icon-cache")
+        .arg("-f")
+        .arg("-t")
+        .arg(&hicolor_root)
+        .spawn();
+    let _ = Command::new("update-desktop-database").arg(&apps_dir).spawn();
 }
 
 fn sanitize_relative_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -405,28 +469,117 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn cancel_gemini_agent(state: tauri::State<'_, AgentCancelState>) -> Result<(), String> {
+    let mut guard = state.tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(());
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn run_gemini_agent(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AgentCancelState>,
     prompt: String,
     active_file: Option<String>,
     files: Vec<AgentFileContext>,
-    thinking_mode: String,
+    effort: Option<String>,
     agent_mode: Option<String>,
+    history: Option<Vec<ChatTurnInput>>,
 ) -> Result<AgentPlanResponse, String> {
     let api_key = resolve_gemini_api_key()?;
     let client = reqwest::Client::new();
+    let started_at = Instant::now();
 
-    let mut context_block = String::new();
-    for f in files.iter().take(24) {
-        context_block.push_str(&format!("\n--- FILE: {} ---\n{}\n", f.path, f.content));
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+    {
+        let mut guard = state.tx.lock().await;
+        if let Some(prev) = guard.take() {
+            let _ = prev.send(());
+        }
+        *guard = Some(cancel_tx);
     }
 
     let is_plan_mode = agent_mode.as_deref() == Some("plan");
-    let thinking_level = if thinking_mode == "deep" { "HIGH" } else { "LOW" };
+    let thinking_level = match effort.as_deref() {
+        Some("xhigh") => "XHIGH",
+        Some("high") => "HIGH",
+        Some("low") => "LOW",
+        _ => "MEDIUM",
+    };
+
+    let mut inspected: Vec<String> = Vec::new();
+    if let Some(ref af) = active_file {
+        inspected.push(af.clone());
+    }
+    for f in &files {
+        if inspected.len() >= 4 {
+            break;
+        }
+        if !inspected.contains(&f.path) {
+            inspected.push(f.path.clone());
+        }
+    }
+    for fp in inspected {
+        let _ = app.emit(
+            "aetheris-agent-event",
+            serde_json::json!({
+                "type": "activity",
+                "activity": {
+                    "id": format!("read-{}", fp),
+                    "kind": "read",
+                    "label": format!("Inspecting {}", fp),
+                    "filePath": fp,
+                    "status": "done"
+                }
+            }),
+        );
+    }
+
+    let _ = app.emit(
+        "aetheris-agent-event",
+        serde_json::json!({
+            "type": "activity",
+            "activity": {
+                "id": "phase-think",
+                "kind": "think",
+                "label": if is_plan_mode { "Analyzing architecture & plan" } else { "Reasoning over workspace edits" },
+                "status": "running"
+            }
+        }),
+    );
+
+    let mut context_block = String::new();
+    for f in files.iter().take(28) {
+        let slice: String = f.content.chars().take(18000).collect();
+        context_block.push_str(&format!("\n--- FILE: {} ---\n{}\n", f.path, slice));
+    }
+
     let system_prompt = if is_plan_mode {
         "You are Aetheris in PLAN MODE (read-only). Analyze the workspace files and produce a structured engineering plan as JSON with: summary (technical findings and design overview), steps (detailed ordered implementation steps citing exact file paths and symbols), and patches (MUST be an empty array [] in Plan Mode—do not emit file modifications)."
     } else {
         "You are Aetheris in ACTION MODE. Inspect the provided workspace files and return JSON with summary, steps (array of strings), and patches (array of {path, action: create|modify|delete, rationale, content}). Always provide complete updated file content when action is create or modify."
     };
+
+    let mut contents: Vec<serde_json::Value> = history
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| !h.content.trim().is_empty())
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|h| {
+            let role = if h.role == "assistant" { "model" } else { "user" };
+            let clipped: String = h.content.chars().take(4000).collect();
+            serde_json::json!({
+                "role": role,
+                "parts": [{ "text": clipped }]
+            })
+        })
+        .collect();
 
     let user_msg = format!(
         "Mode: {}\nActive file: {}\nUser request: {}\nWorkspace files:{}",
@@ -435,52 +588,214 @@ async fn run_gemini_agent(
         prompt,
         context_block
     );
+    contents.push(serde_json::json!({
+        "role": "user",
+        "parts": [{ "text": user_msg }]
+    }));
 
     let body = serde_json::json!({
         "systemInstruction": { "parts": [{ "text": system_prompt }] },
-        "contents": [{ "role": "user", "parts": [{ "text": user_msg }] }],
+        "contents": contents,
         "generationConfig": {
             "responseMimeType": "application/json",
-            "thinkingConfig": { "thinkingLevel": thinking_level }
+            "thinkingConfig": {
+                "thinkingLevel": thinking_level,
+                "includeThoughts": true
+            }
         }
     });
 
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse&key={}",
         api_key
     );
 
-    let res = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error contacting Gemini API: {}", e))?;
+    let send_fut = client.post(&url).json(&body).send();
+    let mut res = tokio::select! {
+        _ = &mut cancel_rx => {
+            return Err("CANCELLED".into());
+        }
+        r = send_fut => {
+            r.map_err(|e| format!("Network error contacting Gemini API: {}", e))?
+        }
+    };
 
     if !res.status().is_success() {
         let txt = res.text().await.unwrap_or_default();
         return Err(format!("Gemini API error: {}", txt));
     }
 
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let raw_text = json["candidates"][0]["content"]["parts"]
-        .as_array()
-        .and_then(|parts| parts.iter().rev().find_map(|p| p["text"].as_str()))
-        .ok_or_else(|| "Empty response from Gemini API".to_string())?;
+    let path_re = Regex::new(r#""path"\s*:\s*"([^"\\]+)""#).ok();
+    let mut sse_buf = String::new();
+    let mut raw_answer = String::new();
+    let mut thoughts_accum = String::new();
+    let mut emitted_drafting = false;
+    let mut seen_paths: Vec<String> = Vec::new();
+    let mut thought_end_ms: Option<u64> = None;
 
-    let mut parsed = serde_json::from_str::<AgentPlanResponse>(raw_text)
-        .map_err(|e| format!("Failed to parse structured agent plan: {}", e))?;
-    if is_plan_mode {
-        parsed.patches.clear();
+    loop {
+        let chunk_opt = tokio::select! {
+            _ = &mut cancel_rx => {
+                return Err("CANCELLED".into());
+            }
+            c = res.chunk() => {
+                c.map_err(|e| format!("Stream read error: {}", e))?
+            }
+        };
+
+        let Some(chunk) = chunk_opt else {
+            break;
+        };
+
+        sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(newline_pos) = sse_buf.find('\n') {
+            let line = sse_buf[..newline_pos].trim().to_string();
+            sse_buf.drain(..=newline_pos);
+
+            if !line.starts_with("data:") {
+                continue;
+            }
+            let payload = line.trim_start_matches("data:").trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            let Some(parts) = json["candidates"][0]["content"]["parts"].as_array() else {
+                continue;
+            };
+
+            for part in parts {
+                let text = part["text"].as_str().unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                if part["thought"].as_bool() == Some(true) {
+                    thoughts_accum.push_str(text);
+                    let _ = app.emit(
+                        "aetheris-agent-event",
+                        serde_json::json!({
+                            "type": "thought",
+                            "delta": text
+                        }),
+                    );
+                } else {
+                    if !emitted_drafting {
+                        emitted_drafting = true;
+                        thought_end_ms = Some(started_at.elapsed().as_millis() as u64);
+                        let _ = app.emit(
+                            "aetheris-agent-event",
+                            serde_json::json!({
+                                "type": "activity",
+                                "activity": {
+                                    "id": "phase-think",
+                                    "kind": "think",
+                                    "label": if is_plan_mode { "Analyzed architecture & plan" } else { "Finished reasoning" },
+                                    "status": "done"
+                                }
+                            }),
+                        );
+                        let _ = app.emit(
+                            "aetheris-agent-event",
+                            serde_json::json!({
+                                "type": "activity",
+                                "activity": {
+                                    "id": "phase-draft",
+                                    "kind": if is_plan_mode { "plan" } else { "edit" },
+                                    "label": if is_plan_mode { "Writing step-by-step plan" } else { "Drafting workspace patches" },
+                                    "status": "running"
+                                }
+                            }),
+                        );
+                    }
+
+                    raw_answer.push_str(text);
+
+                    if !is_plan_mode {
+                        if let Some(ref re) = path_re {
+                            for cap in re.captures_iter(&raw_answer) {
+                                if let Some(m) = cap.get(1) {
+                                    let p = m.as_str().to_string();
+                                    if !seen_paths.contains(&p) {
+                                        seen_paths.push(p.clone());
+                                        let _ = app.emit(
+                                            "aetheris-agent-event",
+                                            serde_json::json!({
+                                                "type": "activity",
+                                                "activity": {
+                                                    "id": format!("edit-{}", p),
+                                                    "kind": "edit",
+                                                    "label": format!("Preparing edit -> {}", p),
+                                                    "filePath": p,
+                                                    "status": "done"
+                                                }
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    Ok(parsed)
+
+    {
+        let mut guard = state.tx.lock().await;
+        *guard = None;
+    }
+
+    #[derive(Deserialize)]
+    struct RawParsed {
+        summary: Option<String>,
+        steps: Option<Vec<String>>,
+        patches: Option<Vec<AgentPatch>>,
+    }
+
+    let parsed = serde_json::from_str::<RawParsed>(raw_answer.trim())
+        .map_err(|e| format!("Failed to parse structured agent plan: {}", e))?;
+
+    let patches = if is_plan_mode {
+        Vec::new()
+    } else {
+        parsed.patches.unwrap_or_default()
+    };
+
+    let _ = app.emit(
+        "aetheris-agent-event",
+        serde_json::json!({
+            "type": "activity",
+            "activity": {
+                "id": "phase-draft",
+                "kind": "done",
+                "label": if is_plan_mode { "Plan ready".to_string() } else { format!("Prepared {} file change(s)", patches.len()) },
+                "status": "done"
+            }
+        }),
+    );
+
+    Ok(AgentPlanResponse {
+        summary: parsed.summary.unwrap_or_else(|| "Completed workspace analysis.".into()),
+        steps: parsed.steps.unwrap_or_default(),
+        patches,
+        thoughts: thoughts_accum.trim().to_string(),
+        thinking_duration_ms: thought_end_ms.unwrap_or_else(|| started_at.elapsed().as_millis() as u64),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AgentCancelState::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(target_os = "linux")]
+            ensure_linux_desktop_integration();
+
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
                     let _ = window.set_icon(icon);
@@ -500,6 +815,7 @@ pub fn run() {
             save_desktop_api_key,
             create_new_workspace_dir,
             chat_gemini,
+            cancel_gemini_agent,
             run_gemini_agent
         ])
         .run(tauri::generate_context!())

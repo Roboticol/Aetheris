@@ -49,15 +49,32 @@ export interface AgentPatch {
   status: PatchStatus;
 }
 
+export type ModelEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type AgentMode = 'plan' | 'action';
+
+export interface AgentActivityItem {
+  id: string;
+  kind: 'read' | 'think' | 'edit' | 'plan' | 'done';
+  label: string;
+  filePath?: string;
+  status: 'running' | 'done';
+}
+
 export interface AgentMessage {
   id: string;
   role: 'user' | 'assistant';
   mode?: AgentMode;
+  effort?: ModelEffort;
   content: string;
+  thoughts?: string;
+  thinkingDurationMs?: number;
+  activity?: AgentActivityItem[];
   steps?: string[];
   patches?: AgentPatch[];
   timestamp: string;
   error?: string;
+  isStreaming?: boolean;
+  cancelled?: boolean;
 }
 
 export interface TerminalEntry {
@@ -69,9 +86,6 @@ export interface TerminalEntry {
   cwd: string;
   timestamp: string;
 }
-
-export type ThinkingMode = 'fast' | 'deep';
-export type AgentMode = 'plan' | 'action';
 
 export interface RecentWorkspace {
   id: string;
