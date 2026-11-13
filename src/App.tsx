@@ -39,7 +39,6 @@ import { DiffViewer } from './components/DiffViewer';
 import { TerminalDrawer } from './components/TerminalDrawer';
 import { AgentPanel } from './components/AgentPanel';
 import { CommandPalette } from './components/CommandPalette';
-import { NativeDesktopModal } from './components/NativeDesktopModal';
 import { Tooltip } from './components/Tooltip';
 
 export default function App() {
@@ -63,7 +62,6 @@ export default function App() {
   const [showRightAgent, setShowRightAgent] = useState(true);
   const [showTerminal, setShowTerminal] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [nativeModalOpen, setNativeModalOpen] = useState(false);
 
   // Search & symbol index
   const [searchQuery, setSearchQuery] = useState('');
@@ -586,7 +584,6 @@ export default function App() {
         onOpenLocalFolder={handleOpenLocalFolder}
         onSelectStarter={handleSelectStarter}
         onResetStarter={handleResetStarter}
-        onOpenNativeBuildModal={() => setNativeModalOpen(true)}
       />
 
       {banner && (
@@ -804,11 +801,6 @@ export default function App() {
         symbols={allSymbols}
         onClose={() => setPaletteOpen(false)}
         onSelectFile={openFile}
-      />
-
-      <NativeDesktopModal
-        open={nativeModalOpen}
-        onClose={() => setNativeModalOpen(false)}
       />
     </div>
   );

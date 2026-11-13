@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import {
   ChevronDown,
-  Cpu,
   FolderOpen,
   PanelBottom,
   PanelLeft,
@@ -27,7 +26,6 @@ interface TopBarProps {
   onOpenLocalFolder: () => void;
   onSelectStarter: (id: string) => void;
   onResetStarter: () => void;
-  onOpenNativeBuildModal: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -45,7 +43,6 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenLocalFolder,
   onSelectStarter,
   onResetStarter,
-  onOpenNativeBuildModal,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -206,19 +203,6 @@ export const TopBar: React.FC<TopBarProps> = ({
             }`}
           >
             <PanelRight className="h-4 w-4" />
-          </button>
-        </Tooltip>
-
-        <div className="mx-1 h-4 w-px bg-[#272B38]" />
-
-        <Tooltip label="Compile Native Rust Desktop Binary (Linux / Windows)">
-          <button
-            type="button"
-            onClick={onOpenNativeBuildModal}
-            className="flex items-center gap-1.5 rounded-md bg-[#6366F1] px-2.5 py-1 text-[12px] font-medium text-white hover:bg-[#818CF8] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#818CF8]"
-          >
-            <Cpu className="h-3.5 w-3.5" />
-            <span>Rust Build</span>
           </button>
         </Tooltip>
       </div>

@@ -4,7 +4,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import JSZip from 'jszip';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -357,21 +356,6 @@ async function searchDirectory(
   }
 }
 
-async function addDirToZip(zip: JSZip, diskDir: string, zipPrefix: string): Promise<void> {
-  const entries = await fs.readdir(diskDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (['node_modules', 'dist', 'target', '.git'].includes(entry.name)) continue;
-    const full = path.join(diskDir, entry.name);
-    const targetZipPath = zipPrefix ? `${zipPrefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      await addDirToZip(zip, full, targetZipPath);
-    } else {
-      const buf = await fs.readFile(full);
-      zip.file(targetZipPath, buf);
-    }
-  }
-}
-
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -646,37 +630,6 @@ async function startServer() {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Agent request failed';
       res.status(500).json({ error: message });
-    }
-  });
-
-  app.get('/api/desktop-bundle', async (_req, res) => {
-    try {
-      const zip = new JSZip();
-      const rootFolder = zip.folder('aetheris-desktop');
-      if (!rootFolder) throw new Error('Failed to initialize zip archive');
-
-      const dirsToInclude = ['src-tauri', 'src'];
-      for (const d of dirsToInclude) {
-        const diskPath = path.join(__dirname, d);
-        await addDirToZip(rootFolder, diskPath, d);
-      }
-
-      const rootFiles = ['README.md', 'package.json', 'tsconfig.json', 'vite.config.ts', 'index.html', 'metadata.json'];
-      for (const f of rootFiles) {
-        try {
-          const buf = await fs.readFile(path.join(__dirname, f));
-          rootFolder.file(f, buf);
-        } catch {
-          // Optional file skipped if absent
-        }
-      }
-
-      const archiveBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="aetheris-rust-desktop.zip"');
-      res.send(archiveBuffer);
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to build desktop bundle' });
     }
   });
 
