@@ -377,15 +377,97 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '8mb' }));
 
-  app.get('/api/workspaces', (_req, res) => {
-    res.json({
-      workspaces: STARTER_TEMPLATES.map((t) => ({
-        id: t.id,
-        name: t.name,
-        description: t.description,
-        language: t.language,
-      })),
-    });
+  app.get('/api/workspaces', async (_req, res) => {
+    try {
+      const entries = await fs.readdir(WORKSPACES_ROOT, { withFileTypes: true });
+      const starterMap = new Map(STARTER_TEMPLATES.map((t) => [t.id, t]));
+      const list = entries
+        .filter((e) => e.isDirectory())
+        .map((e) => {
+          const tpl = starterMap.get(e.name);
+          if (tpl) {
+            return {
+              id: tpl.id,
+              name: tpl.name,
+              description: tpl.description,
+              language: tpl.language,
+            };
+          }
+          return {
+            id: e.name,
+            name: e.name,
+            description: 'Custom workspace folder',
+            language: 'Folder',
+          };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json({ workspaces: list });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list workspaces' });
+    }
+  });
+
+  app.post('/api/workspaces', async (req, res) => {
+    try {
+      const { name, template } = req.body as {
+        name?: string;
+        template?: 'blank' | 'rust' | 'typescript';
+      };
+      const slug = (name ?? '')
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      if (!slug) {
+        res.status(400).json({ error: 'Folder name must contain letters or numbers.' });
+        return;
+      }
+
+      const { root } = resolveSafeWorkspacePath(slug);
+      await fs.mkdir(root, { recursive: true });
+
+      if (template === 'rust') {
+        await fs.mkdir(path.join(root, 'src'), { recursive: true });
+        await fs.writeFile(
+          path.join(root, 'Cargo.toml'),
+          `[package]\nname = "${slug}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n`,
+          'utf-8'
+        );
+        await fs.writeFile(
+          path.join(root, 'src', 'main.rs'),
+          `fn main() {\n    println!("Hello from ${slug}");\n}\n`,
+          'utf-8'
+        );
+      } else if (template === 'typescript') {
+        await fs.mkdir(path.join(root, 'src'), { recursive: true });
+        await fs.writeFile(
+          path.join(root, 'package.json'),
+          `{\n  "name": "${slug}",\n  "version": "0.1.0",\n  "type": "module"\n}\n`,
+          'utf-8'
+        );
+        await fs.writeFile(
+          path.join(root, 'src', 'index.ts'),
+          `export function main(): void {\n  console.log("Hello from ${slug}");\n}\n\nmain();\n`,
+          'utf-8'
+        );
+      } else {
+        await fs.writeFile(
+          path.join(root, 'README.md'),
+          `# ${slug}\n\nWorkspace created in Aetheris.\n`,
+          'utf-8'
+        );
+      }
+
+      res.json({
+        workspace: {
+          id: slug,
+          name: slug,
+          description: 'Custom workspace folder',
+          language: template === 'rust' ? 'Rust' : template === 'typescript' ? 'TypeScript' : 'Folder',
+        },
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create folder' });
+    }
   });
 
   app.get('/api/workspaces/:id/tree', async (req, res) => {
@@ -556,11 +638,12 @@ async function startServer() {
 
   app.post('/api/agent/plan', async (req, res) => {
     try {
-      const { prompt, activeFile, files, thinkingMode } = req.body as {
+      const { prompt, activeFile, files, thinkingMode, agentMode } = req.body as {
         prompt: string;
         activeFile?: string | null;
         files: Array<{ path: string; content: string }>;
         thinkingMode?: 'fast' | 'deep';
+        agentMode?: 'plan' | 'action';
       };
 
       if (!prompt || !prompt.trim()) {
@@ -568,6 +651,7 @@ async function startServer() {
         return;
       }
 
+      const isPlanMode = agentMode === 'plan';
       const ai = getGeminiClient();
       const contextFiles = (files ?? [])
         .slice(0, 28)
@@ -576,12 +660,15 @@ async function startServer() {
 
       const thinkingLevel = thinkingMode === 'deep' ? ThinkingLevel.HIGH : ThinkingLevel.LOW;
 
+      const systemInstruction = isPlanMode
+        ? 'You are Aetheris in PLAN MODE (read-only architectural and implementation planning). Inspect the provided workspace files carefully and produce a concrete, step-by-step engineering plan explaining which files, functions, and data flows should change and why. Do NOT emit file edits in Plan Mode: always return an empty patches array [].'
+        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding). Inspect the provided workspace files carefully. Respond with a concise engineering summary, clear verification/inspection steps you took, and structured multi-file patches. Whenever creating or modifying a file, provide the COMPLETE updated file content (never truncate with ellipses or placeholders).';
+
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
-        contents: `Active editor file: ${activeFile ?? 'none'}\n\nUser request:\n${prompt}\n\nWorkspace context:\n${contextFiles}`,
+        contents: `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (generate patches)'}\nActive editor file: ${activeFile ?? 'none'}\n\nUser request:\n${prompt}\n\nWorkspace context:\n${contextFiles}`,
         config: {
-          systemInstruction:
-            'You are Aetheris, a senior autonomous multi-file coding agent inside a lightweight Rust-native IDE. Inspect the provided workspace files carefully. Respond with a concise engineering summary, clear verification/inspection steps you took, and structured multi-file patches. Whenever creating or modifying a file, provide the COMPLETE updated file content (never truncate with ellipses or placeholders). If the user only asks a question without requesting code edits, return an empty patches array.',
+          systemInstruction,
           thinkingConfig: { thinkingLevel },
           responseMimeType: 'application/json',
           responseSchema: {
@@ -589,12 +676,16 @@ async function startServer() {
             properties: {
               summary: {
                 type: Type.STRING,
-                description: 'Clear, concise technical explanation of findings and proposed edits.',
+                description: isPlanMode
+                  ? 'Clear architectural analysis and implementation plan overview.'
+                  : 'Clear, concise technical explanation of findings and proposed edits.',
               },
               steps: {
                 type: Type.ARRAY,
                 items: { type: Type.STRING },
-                description: 'Ordered trace of workspace inspection and editing steps.',
+                description: isPlanMode
+                  ? 'Concrete ordered implementation steps referencing exact file paths and symbols.'
+                  : 'Ordered trace of workspace inspection and editing steps.',
               },
               patches: {
                 type: Type.ARRAY,
@@ -625,10 +716,44 @@ async function startServer() {
       res.json({
         summary: parsed.summary ?? 'Completed workspace analysis.',
         steps: Array.isArray(parsed.steps) ? parsed.steps : [],
-        patches: Array.isArray(parsed.patches) ? parsed.patches : [],
+        patches: isPlanMode ? [] : Array.isArray(parsed.patches) ? parsed.patches : [],
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Agent request failed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/agent/chat', async (req, res) => {
+    try {
+      const { messages } = req.body as {
+        messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+      };
+      const cleaned = (messages ?? []).filter((m) => m.content && m.content.trim());
+      if (cleaned.length === 0) {
+        res.status(400).json({ error: 'Message cannot be empty.' });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const contents = cleaned.slice(-16).map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      }));
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents,
+        config: {
+          systemInstruction:
+            'You are Aetheris, a friendly, concise engineering companion on the IDE home screen. Chat naturally for smalltalk, brainstorm ideas, or answer quick technical questions concisely.',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      });
+
+      res.json({ reply: (response.text ?? '').trim() || 'No response returned.' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Chat request failed';
       res.status(500).json({ error: message });
     }
   });

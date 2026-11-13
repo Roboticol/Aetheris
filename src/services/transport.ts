@@ -1,6 +1,8 @@
 import {
+  AgentMode,
   AgentPatch,
   FileNode,
+  RecentWorkspace,
   SearchHit,
   TerminalEntry,
   ThinkingMode,
@@ -398,8 +400,9 @@ export async function runAgentPlan(params: {
   tree: FileNode[];
   openBuffers: Record<string, string>;
   thinkingMode: ThinkingMode;
+  agentMode: AgentMode;
 }): Promise<{ summary: string; steps: string[]; patches: AgentPatch[] }> {
-  const { ctx, prompt, activeFile, tree, openBuffers, thinkingMode } = params;
+  const { ctx, prompt, activeFile, tree, openBuffers, thinkingMode, agentMode } = params;
   const candidatePaths = flattenFilePaths(tree).slice(0, 24);
 
   const files: Array<{ path: string; content: string }> = [];
@@ -428,6 +431,7 @@ export async function runAgentPlan(params: {
       activeFile,
       files,
       thinkingMode,
+      agentMode,
     });
   } else {
     const res = await fetch('/api/agent/plan', {
@@ -438,6 +442,7 @@ export async function runAgentPlan(params: {
         activeFile,
         files,
         thinkingMode,
+        agentMode,
       }),
     });
     const data = (await res.json()) as {
@@ -457,28 +462,187 @@ export async function runAgentPlan(params: {
   }
 
   const originalMap = new Map(files.map((f) => [f.path, f.content]));
-  const patches: AgentPatch[] = rawResult.patches.map((p, idx) => {
-    const normalizedAction =
-      p.action === 'create' || p.action === 'delete' || p.action === 'modify'
-        ? p.action
-        : originalMap.has(p.path)
-          ? 'modify'
-          : 'create';
+  const patches: AgentPatch[] =
+    agentMode === 'plan'
+      ? []
+      : rawResult.patches.map((p, idx) => {
+          const normalizedAction =
+            p.action === 'create' || p.action === 'delete' || p.action === 'modify'
+              ? p.action
+              : originalMap.has(p.path)
+                ? 'modify'
+                : 'create';
 
-    return {
-      id: `${Date.now()}-${idx}-${p.path}`,
-      path: p.path,
-      action: normalizedAction,
-      rationale: p.rationale ?? '',
-      content: p.content ?? '',
-      originalContent: originalMap.get(p.path) ?? '',
-      status: 'pending',
-    };
-  });
+          return {
+            id: `${Date.now()}-${idx}-${p.path}`,
+            path: p.path,
+            action: normalizedAction,
+            rationale: p.rationale ?? '',
+            content: p.content ?? '',
+            originalContent: originalMap.get(p.path) ?? '',
+            status: 'pending',
+          };
+        });
 
   return {
     summary: rawResult.summary,
     steps: rawResult.steps,
     patches,
   };
+}
+
+export async function createServerWorkspaceFolder(
+  name: string,
+  template: 'blank' | 'rust' | 'typescript'
+): Promise<WorkspaceSummary> {
+  const res = await fetch('/api/workspaces', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, template }),
+  });
+  const data = (await res.json()) as { workspace?: WorkspaceSummary; error?: string };
+  if (!res.ok || !data.workspace) {
+    throw new Error(data.error ?? 'Failed to create folder');
+  }
+  return data.workspace;
+}
+
+export async function createTauriWorkspaceFolder(
+  parentDir: string,
+  name: string,
+  template: 'blank' | 'rust' | 'typescript'
+): Promise<string> {
+  const createdPath = await tauriInvoke<string>('create_new_workspace_dir', {
+    parentDir,
+    name,
+  });
+
+  if (template === 'rust') {
+    await tauriInvoke('write_workspace_file', {
+      root: createdPath,
+      relPath: 'Cargo.toml',
+      content: `[package]\nname = "${name.trim()}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n`,
+    });
+    await tauriInvoke('write_workspace_file', {
+      root: createdPath,
+      relPath: 'src/main.rs',
+      content: `fn main() {\n    println!("Hello from ${name.trim()}");\n}\n`,
+    });
+  } else if (template === 'typescript') {
+    await tauriInvoke('write_workspace_file', {
+      root: createdPath,
+      relPath: 'package.json',
+      content: `{\n  "name": "${name.trim()}",\n  "version": "0.1.0",\n  "type": "module"\n}\n`,
+    });
+    await tauriInvoke('write_workspace_file', {
+      root: createdPath,
+      relPath: 'src/index.ts',
+      content: `export function main(): void {\n  console.log("Hello from ${name.trim()}");\n}\n\nmain();\n`,
+    });
+  } else {
+    await tauriInvoke('write_workspace_file', {
+      root: createdPath,
+      relPath: 'README.md',
+      content: `# ${name.trim()}\n\nWorkspace created in Aetheris.\n`,
+    });
+  }
+
+  return createdPath;
+}
+
+export async function sendHomeChat(
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+): Promise<string> {
+  if (isTauriRuntime()) {
+    return tauriInvoke<string>('chat_gemini', { messages });
+  }
+  const res = await fetch('/api/agent/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  });
+  const data = (await res.json()) as { reply?: string; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Chat request failed');
+  }
+  return data.reply ?? '';
+}
+
+const RECENTS_KEY = 'aetheris.recentWorkspaces';
+const IDB_NAME = 'aetheris-handles';
+const IDB_STORE = 'dirHandles';
+
+function openHandleDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function saveLocalDirHandle(id: string, handle: FileSystemDirectoryHandle): Promise<void> {
+  try {
+    const db = await openHandleDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(handle, id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // IndexedDB unavailable
+  }
+}
+
+export async function loadLocalDirHandle(id: string): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    const db = await openHandleDb();
+    return await new Promise<FileSystemDirectoryHandle | null>((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(id);
+      req.onsuccess = () => resolve((req.result as FileSystemDirectoryHandle | undefined) ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function loadRecentWorkspaces(): RecentWorkspace[] {
+  try {
+    const raw = localStorage.getItem(RECENTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as RecentWorkspace[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function recordRecentWorkspace(entry: RecentWorkspace): RecentWorkspace[] {
+  const existing = loadRecentWorkspaces().filter(
+    (item) => !(item.id === entry.id && item.source === entry.source)
+  );
+  const next = [entry, ...existing].slice(0, 8);
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {
+    // Storage quota ignored
+  }
+  return next;
+}
+
+export function removeRecentWorkspace(id: string, source: WorkspaceSource): RecentWorkspace[] {
+  const next = loadRecentWorkspaces().filter((item) => !(item.id === id && item.source === source));
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {
+    // Storage quota ignored
+  }
+  return next;
 }

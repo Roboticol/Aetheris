@@ -4,12 +4,14 @@ import {
   Check,
   CheckCheck,
   FileDiff,
+  ListChecks,
   Loader2,
+  Play,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
-import { AgentMessage, AgentPatch, ThinkingMode } from '../types/ide';
+import { AgentMessage, AgentMode, AgentPatch, ThinkingMode } from '../types/ide';
 import { Tooltip } from './Tooltip';
 
 interface AgentPanelProps {
@@ -17,9 +19,11 @@ interface AgentPanelProps {
   activeFilePath: string | null;
   workspaceFileCount: number;
   thinkingMode: ThinkingMode;
+  agentMode: AgentMode;
   isBusy: boolean;
   onThinkingModeChange: (mode: ThinkingMode) => void;
-  onSendPrompt: (prompt: string) => Promise<void>;
+  onAgentModeChange: (mode: AgentMode) => void;
+  onSendPrompt: (prompt: string, overrideMode?: AgentMode) => Promise<void>;
   onInspectPatch: (patch: AgentPatch) => void;
   onAcceptPatch: (patchId: string) => void;
   onRejectPatch: (patchId: string) => void;
@@ -38,8 +42,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   activeFilePath,
   workspaceFileCount,
   thinkingMode,
+  agentMode,
   isBusy,
   onThinkingModeChange,
+  onAgentModeChange,
   onSendPrompt,
   onInspectPatch,
   onAcceptPatch,
@@ -73,12 +79,43 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           <span className="text-[12.5px] font-semibold text-[#E6E8EE]">Agent</span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          <div className="flex items-center rounded-md bg-[#0F1117] p-0.5">
+            <Tooltip label="Read-only architecture & step-by-step plan">
+              <button
+                type="button"
+                onClick={() => onAgentModeChange('plan')}
+                className={`flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  agentMode === 'plan'
+                    ? 'bg-[#1E222E] text-[#E6E8EE]'
+                    : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                }`}
+              >
+                <ListChecks className="h-3 w-3" />
+                <span>Plan</span>
+              </button>
+            </Tooltip>
+            <Tooltip label="Generate multi-file code diffs for review">
+              <button
+                type="button"
+                onClick={() => onAgentModeChange('action')}
+                className={`flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  agentMode === 'action'
+                    ? 'bg-[#6366F1]/25 text-[#818CF8]'
+                    : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                }`}
+              >
+                <Play className="h-3 w-3" />
+                <span>Action</span>
+              </button>
+            </Tooltip>
+          </div>
+
           <div className="flex items-center rounded-md bg-[#0F1117] p-0.5">
             <button
               type="button"
               onClick={() => onThinkingModeChange('fast')}
-              className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 thinkingMode === 'fast'
                   ? 'bg-[#1E222E] text-[#E6E8EE]'
                   : 'text-[#8B92A5] hover:text-[#E6E8EE]'
@@ -89,7 +126,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <button
               type="button"
               onClick={() => onThinkingModeChange('deep')}
-              className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+              className={`rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                 thinkingMode === 'deep'
                   ? 'bg-[#6366F1]/25 text-[#818CF8]'
                   : 'text-[#8B92A5] hover:text-[#E6E8EE]'
@@ -194,6 +231,30 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     ))}
                   </ul>
                 )}
+
+                {msg.role === 'assistant' &&
+                  msg.mode === 'plan' &&
+                  !msg.error &&
+                  (!msg.patches || msg.patches.length === 0) && (
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() => {
+                          onAgentModeChange('action');
+                          const stepsText = (msg.steps ?? []).map((s, idx) => `${idx + 1}. ${s}`).join('\n');
+                          void onSendPrompt(
+                            `Implement the following approved plan across the workspace:\n\n${msg.content}\n\nSteps:\n${stepsText}`,
+                            'action'
+                          );
+                        }}
+                        className="flex items-center gap-1.5 rounded-md bg-[#6366F1] px-2.5 py-1.5 text-[11.5px] font-medium text-white hover:bg-[#818CF8] disabled:opacity-40 transition-colors"
+                      >
+                        <Play className="h-3 w-3" />
+                        <span>Execute Plan in Action Mode</span>
+                      </button>
+                    </div>
+                  )}
 
                 {msg.patches && msg.patches.length > 0 && (
                   <div className="space-y-1.5 pt-1">
@@ -310,17 +371,23 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 void handleSubmit();
               }
             }}
-            placeholder="Ask Aetheris to edit files, add features, or explain code..."
+            placeholder={
+              agentMode === 'plan'
+                ? 'Plan mode (read-only): describe a feature or refactor to design a step-by-step plan...'
+                : 'Action mode: ask Aetheris to edit files, add features, or fix bugs...'
+            }
             className="w-full resize-none bg-transparent text-[12.5px] text-[#E6E8EE] placeholder-[#52596E] focus:outline-none"
           />
           <div className="mt-1.5 flex items-center justify-between">
-            <span className="text-[11px] text-[#8B92A5]">Enter to run · Shift+Enter newline</span>
+            <span className="text-[11px] text-[#8B92A5]">
+              {agentMode === 'plan' ? 'Plan (read-only)' : 'Action (edits)'} · Enter to run
+            </span>
             <button
               type="submit"
               disabled={isBusy || !prompt.trim()}
               className="flex items-center gap-1 rounded-md bg-[#6366F1] px-2.5 py-1 text-[11.5px] font-medium text-white hover:bg-[#818CF8] disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
             >
-              <span>Run</span>
+              <span>{agentMode === 'plan' ? 'Plan' : 'Run'}</span>
               <ArrowUp className="h-3.5 w-3.5" />
             </button>
           </div>

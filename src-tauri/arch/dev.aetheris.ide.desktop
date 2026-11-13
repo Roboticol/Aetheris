@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aetheris
+Comment=Lightweight Rust-native agentic coding IDE
+Exec=aetheris %F
+Icon=aetheris
+Terminal=false
+Categories=Development;IDE;TextEditor;
+StartupNotify=true
+StartupWMClass=aetheris

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   ChevronDown,
   FolderOpen,
+  Home,
   PanelBottom,
   PanelLeft,
   PanelRight,
@@ -9,6 +10,7 @@ import {
   Search,
 } from 'lucide-react';
 import { WorkspaceSource, WorkspaceSummary } from '../types/ide';
+import { DigitalClock } from './DigitalClock';
 import { Tooltip } from './Tooltip';
 
 interface TopBarProps {
@@ -26,6 +28,7 @@ interface TopBarProps {
   onOpenLocalFolder: () => void;
   onSelectStarter: (id: string) => void;
   onResetStarter: () => void;
+  onGoHome: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -43,16 +46,36 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenLocalFolder,
   onSelectStarter,
   onResetStarter,
+  onGoHome,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
     <header className="relative z-30 flex h-10 shrink-0 items-center justify-between gap-6 border-b border-[#272B38] bg-[#161922] px-3 select-none">
-      {/* Zone 1: Brand + Workspace Switcher */}
-      <div className="flex items-center gap-3 min-w-0">
-        <span className="text-[14px] font-bold tracking-tight text-[#E6E8EE] whitespace-nowrap shrink-0">
-          Aetheris
-        </span>
+      {/* Zone 1: Brand / Home + Workspace Switcher */}
+      <div className="flex items-center gap-2.5 min-w-0">
+        <Tooltip label="Home Screen">
+          <button
+            type="button"
+            onClick={onGoHome}
+            className="flex items-center gap-2 rounded-md px-1.5 py-1 text-[14px] font-bold tracking-tight text-[#E6E8EE] hover:bg-[#1E222E] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#6366F1]"
+          >
+            <img src="/icon.svg" alt="" className="h-4 w-4 rounded-sm" />
+            <span>Aetheris</span>
+          </button>
+        </Tooltip>
+
+        <Tooltip label="Return to Home Screen">
+          <button
+            type="button"
+            onClick={onGoHome}
+            aria-label="Home Screen"
+            className="rounded-md p-1 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors shrink-0"
+          >
+            <Home className="h-3.5 w-3.5" />
+          </button>
+        </Tooltip>
+
         <span className="text-[#272B38]" aria-hidden="true">
           /
         </span>
@@ -159,8 +182,12 @@ export const TopBar: React.FC<TopBarProps> = ({
         <kbd className="font-mono text-[11px] text-[#8B92A5] shrink-0">Ctrl+P</kbd>
       </button>
 
-      {/* Zone 3: Layout Toggles & Native Rust Build */}
+      {/* Zone 3: Digital Clock & Layout Toggles */}
       <div className="flex items-center gap-1.5 shrink-0">
+        <DigitalClock variant="topbar" />
+
+        <div className="mx-1 h-4 w-px bg-[#272B38]" />
+
         <Tooltip label="Toggle Explorer" shortcut="Ctrl+B">
           <button
             type="button"

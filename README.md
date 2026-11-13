@@ -42,7 +42,10 @@ For a distro-agnostic bundle:
 cargo tauri build --bundles appimage
 ```
 
-> **Note for KDE Plasma Wayland + NVIDIA**: If `webkit2gtk-4.1` gives you a blank window frame on Wayland, launch with `WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/aetheris`.
+> **Note for KDE Plasma Wayland**:
+> - If you launch the raw `./src-tauri/target/release/aetheris` binary directly instead of installing via `PKGBUILD`, Wayland falls back to a generic `W` taskbar icon until a matching `.desktop` file exists. Install it locally once:
+>   `install -Dm644 src-tauri/arch/dev.aetheris.ide.desktop ~/.local/share/applications/dev.aetheris.ide.desktop && install -Dm644 src-tauri/icons/icon.png ~/.local/share/icons/hicolor/128x128/apps/aetheris.png`
+> - On NVIDIA + Wayland, if `webkit2gtk-4.1` shows blank compositor frames, launch with `WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/aetheris`.
 
 ## Building on Windows
 

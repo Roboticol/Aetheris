@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use tauri::Manager;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -331,12 +332,85 @@ fn save_desktop_api_key(api_key: String) -> Result<(), String> {
     Err("Unable to persist API key to keyring or config directory".into())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTurnInput {
+    pub role: String,
+    pub content: String,
+}
+
+#[tauri::command]
+fn create_new_workspace_dir(parent_dir: String, name: String) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') || trimmed == ".." {
+        return Err("Invalid folder name".into());
+    }
+    let target = PathBuf::from(&parent_dir).join(trimmed);
+    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<String, String> {
+    let api_key = resolve_gemini_api_key()?;
+    let client = reqwest::Client::new();
+
+    let contents: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|m| {
+            let role = if m.role == "assistant" { "model" } else { "user" };
+            serde_json::json!({
+                "role": role,
+                "parts": [{ "text": m.content }]
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [{
+                "text": "You are Aetheris, a friendly, concise coding companion inside a lightweight Rust-native IDE. Answer quick questions, chat naturally, or help brainstorm ideas cleanly."
+            }]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "thinkingConfig": { "thinkingLevel": "LOW" }
+        }
+    });
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={}",
+        api_key
+    );
+
+    let res = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error contacting Gemini API: {}", e))?;
+
+    if !res.status().is_success() {
+        let txt = res.text().await.unwrap_or_default();
+        return Err(format!("Gemini API error: {}", txt));
+    }
+
+    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let reply = json["candidates"][0]["content"]["parts"]
+        .as_array()
+        .and_then(|parts| parts.iter().rev().find_map(|p| p["text"].as_str()))
+        .ok_or_else(|| "Empty response from Gemini API".to_string())?;
+
+    Ok(reply.to_string())
+}
+
 #[tauri::command]
 async fn run_gemini_agent(
     prompt: String,
     active_file: Option<String>,
     files: Vec<AgentFileContext>,
     thinking_mode: String,
+    agent_mode: Option<String>,
 ) -> Result<AgentPlanResponse, String> {
     let api_key = resolve_gemini_api_key()?;
     let client = reqwest::Client::new();
@@ -346,11 +420,17 @@ async fn run_gemini_agent(
         context_block.push_str(&format!("\n--- FILE: {} ---\n{}\n", f.path, f.content));
     }
 
+    let is_plan_mode = agent_mode.as_deref() == Some("plan");
     let thinking_level = if thinking_mode == "deep" { "HIGH" } else { "LOW" };
-    let system_prompt = "You are Aetheris, an autonomous multi-file coding agent. Inspect the provided workspace files and return JSON with summary, steps (array of strings), and patches (array of {path, action: create|modify|delete, rationale, content}). Always provide complete updated file content when action is create or modify.";
+    let system_prompt = if is_plan_mode {
+        "You are Aetheris in PLAN MODE (read-only). Analyze the workspace files and produce a structured engineering plan as JSON with: summary (technical findings and design overview), steps (detailed ordered implementation steps citing exact file paths and symbols), and patches (MUST be an empty array [] in Plan Mode—do not emit file modifications)."
+    } else {
+        "You are Aetheris in ACTION MODE. Inspect the provided workspace files and return JSON with summary, steps (array of strings), and patches (array of {path, action: create|modify|delete, rationale, content}). Always provide complete updated file content when action is create or modify."
+    };
 
     let user_msg = format!(
-        "Active file: {}\nUser request: {}\nWorkspace files:{}",
+        "Mode: {}\nActive file: {}\nUser request: {}\nWorkspace files:{}",
+        if is_plan_mode { "PLAN" } else { "ACTION" },
         active_file.unwrap_or_else(|| "none".into()),
         prompt,
         context_block
@@ -383,18 +463,31 @@ async fn run_gemini_agent(
     }
 
     let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let raw_text = json["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
+    let raw_text = json["candidates"][0]["content"]["parts"]
+        .as_array()
+        .and_then(|parts| parts.iter().rev().find_map(|p| p["text"].as_str()))
         .ok_or_else(|| "Empty response from Gemini API".to_string())?;
 
-    serde_json::from_str::<AgentPlanResponse>(raw_text)
-        .map_err(|e| format!("Failed to parse structured agent plan: {}", e))
+    let mut parsed = serde_json::from_str::<AgentPlanResponse>(raw_text)
+        .map_err(|e| format!("Failed to parse structured agent plan: {}", e))?;
+    if is_plan_mode {
+        parsed.patches.clear();
+    }
+    Ok(parsed)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
+                    let _ = window.set_icon(icon);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_workspace_tree,
             read_workspace_file,
@@ -405,6 +498,8 @@ pub fn run() {
             search_workspace,
             exec_terminal_command,
             save_desktop_api_key,
+            create_new_workspace_dir,
+            chat_gemini,
             run_gemini_agent
         ])
         .run(tauri::generate_context!())

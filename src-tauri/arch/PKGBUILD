@@ -21,4 +21,7 @@ build() {
 package() {
   cd "$startdir/.."
   install -Dm755 "src-tauri/target/release/aetheris" "$pkgdir/usr/bin/aetheris"
+  install -Dm644 "src-tauri/arch/dev.aetheris.ide.desktop" "$pkgdir/usr/share/applications/dev.aetheris.ide.desktop"
+  install -Dm644 "src-tauri/icons/icon.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/aetheris.png"
+  install -Dm644 "src-tauri/icons/icon.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/aetheris.svg"
 }

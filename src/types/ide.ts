@@ -52,6 +52,7 @@ export interface AgentPatch {
 export interface AgentMessage {
   id: string;
   role: 'user' | 'assistant';
+  mode?: AgentMode;
   content: string;
   steps?: string[];
   patches?: AgentPatch[];
@@ -70,3 +71,20 @@ export interface TerminalEntry {
 }
 
 export type ThinkingMode = 'fast' | 'deep';
+export type AgentMode = 'plan' | 'action';
+
+export interface RecentWorkspace {
+  id: string;
+  name: string;
+  source: WorkspaceSource;
+  nativeRoot?: string;
+  lastOpenedAt: string;
+}
+
+export interface HomeChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+  error?: string;
+}

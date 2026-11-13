@@ -7,10 +7,13 @@ import {
 } from 'lucide-react';
 import {
   AgentMessage,
+  AgentMode,
   AgentPatch,
   CursorPosition,
   EditorTab,
   FileNode,
+  HomeChatMessage,
+  RecentWorkspace,
   SearchHit,
   TerminalEntry,
   ThinkingMode,
@@ -18,6 +21,8 @@ import {
 } from './types/ide';
 import {
   ActiveWorkspaceContext,
+  createServerWorkspaceFolder,
+  createTauriWorkspaceFolder,
   createWorkspaceEntry,
   deleteWorkspaceEntry,
   execWorkspaceCommand,
@@ -25,11 +30,17 @@ import {
   flattenFilePaths,
   isTauriRuntime,
   listStarterWorkspaces,
+  loadLocalDirHandle,
+  loadRecentWorkspaces,
   readWorkspaceFile,
+  recordRecentWorkspace,
+  removeRecentWorkspace,
   renameWorkspaceEntry,
   resetStarterWorkspace,
   runAgentPlan,
+  saveLocalDirHandle,
   searchWorkspace,
+  sendHomeChat,
   writeWorkspaceFile,
 } from './services/transport';
 import { TopBar } from './components/TopBar';
@@ -39,10 +50,15 @@ import { DiffViewer } from './components/DiffViewer';
 import { TerminalDrawer } from './components/TerminalDrawer';
 import { AgentPanel } from './components/AgentPanel';
 import { CommandPalette } from './components/CommandPalette';
+import { HomeScreen } from './components/HomeScreen';
 import { Tooltip } from './components/Tooltip';
 
 export default function App() {
+  const [view, setView] = useState<'home' | 'editor'>('home');
   const [starters, setStarters] = useState<WorkspaceSummary[]>([]);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>(() =>
+    loadRecentWorkspaces()
+  );
   const [workspaceCtx, setWorkspaceCtx] = useState<ActiveWorkspaceContext>({
     source: 'starter',
     id: 'rust-cli-indexer',
@@ -73,8 +89,13 @@ export default function App() {
   // Agent & Diff state
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('fast');
+  const [agentMode, setAgentMode] = useState<AgentMode>('action');
   const [isAgentBusy, setIsAgentBusy] = useState(false);
   const [activeDiffPatchId, setActiveDiffPatchId] = useState<string | null>(null);
+
+  // Home smalltalk chat state
+  const [homeChatMessages, setHomeChatMessages] = useState<HomeChatMessage[]>([]);
+  const [isHomeChatBusy, setIsHomeChatBusy] = useState(false);
 
   // Terminal state
   const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
@@ -131,7 +152,7 @@ export default function App() {
     [showNotice]
   );
 
-  // Boot: load starters & initial workspace
+  // Boot: load available workspaces (stays on HomeScreen until user picks/opens one)
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -139,23 +160,16 @@ export default function App() {
         const list = await listStarterWorkspaces();
         if (!mounted) return;
         setStarters(list);
-        const initial: ActiveWorkspaceContext = {
-          source: 'starter',
-          id: list[0]?.id ?? 'rust-cli-indexer',
-          name: list[0]?.name ?? 'rust-cli-indexer',
-        };
-        setWorkspaceCtx(initial);
-        await refreshWorkspace(initial, true);
       } catch (err) {
         if (mounted) {
-          showNotice('error', err instanceof Error ? err.message : 'Failed to initialize IDE');
+          showNotice('error', err instanceof Error ? err.message : 'Failed to initialize workspaces');
         }
       }
     })();
     return () => {
       mounted = false;
     };
-  }, [refreshWorkspace, showNotice]);
+  }, [showNotice]);
 
   const openFile = useCallback(
     async (filePath: string, line?: number) => {
@@ -261,6 +275,17 @@ export default function App() {
         setWorkspaceCtx(nextCtx);
         setAgentMessages([]);
         setTerminalEntries([]);
+        setActiveDiffPatchId(null);
+        setView('editor');
+        setRecentWorkspaces(
+          recordRecentWorkspace({
+            id: selected,
+            name: folderName,
+            source: 'tauri-native',
+            nativeRoot: selected,
+            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          })
+        );
         await refreshWorkspace(nextCtx, true);
         return;
       }
@@ -268,7 +293,7 @@ export default function App() {
       if (!window.showDirectoryPicker) {
         showNotice(
           'error',
-          'Your current browser or embedded frame does not support local directory picking. Use the Native Rust Build on Linux/Windows or a Chromium desktop browser.'
+          'Your current browser or embedded frame does not support local directory picking. Use the native Linux/Windows app or a Chromium desktop browser.'
         );
         return;
       }
@@ -280,9 +305,20 @@ export default function App() {
         name: dirHandle.name,
         localDirHandle: dirHandle,
       };
+      await saveLocalDirHandle(dirHandle.name, dirHandle);
       setWorkspaceCtx(nextCtx);
       setAgentMessages([]);
       setTerminalEntries([]);
+      setActiveDiffPatchId(null);
+      setView('editor');
+      setRecentWorkspaces(
+        recordRecentWorkspace({
+          id: dirHandle.name,
+          name: dirHandle.name,
+          source: 'local-fs',
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        })
+      );
       await refreshWorkspace(nextCtx, true);
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return;
@@ -306,7 +342,191 @@ export default function App() {
     setAgentMessages([]);
     setTerminalEntries([]);
     setActiveDiffPatchId(null);
+    setView('editor');
+    setRecentWorkspaces(
+      recordRecentWorkspace({
+        id,
+        name: nextCtx.name,
+        source: 'starter',
+        lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      })
+    );
     await refreshWorkspace(nextCtx, true);
+  };
+
+  const handleCreateNewFolder = async (
+    name: string,
+    template: 'blank' | 'rust' | 'typescript'
+  ) => {
+    try {
+      if (isTauriRuntime()) {
+        const parent = await window.__TAURI_INTERNALS__!.invoke<string | null>(
+          'plugin:dialog|open',
+          { options: { directory: true, multiple: false, title: 'Choose parent directory' } }
+        );
+        if (!parent) return;
+        const createdPath = await createTauriWorkspaceFolder(parent, name, template);
+        const folderName = createdPath.split(/[/\\]/).filter(Boolean).pop() ?? name;
+        const nextCtx: ActiveWorkspaceContext = {
+          source: 'tauri-native',
+          id: createdPath,
+          name: folderName,
+          nativeRoot: createdPath,
+        };
+        setWorkspaceCtx(nextCtx);
+        setAgentMessages([]);
+        setTerminalEntries([]);
+        setActiveDiffPatchId(null);
+        setView('editor');
+        setRecentWorkspaces(
+          recordRecentWorkspace({
+            id: createdPath,
+            name: folderName,
+            source: 'tauri-native',
+            nativeRoot: createdPath,
+            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          })
+        );
+        await refreshWorkspace(nextCtx, true);
+        return;
+      }
+
+      const created = await createServerWorkspaceFolder(name, template);
+      const updatedList = await listStarterWorkspaces();
+      setStarters(updatedList);
+      const nextCtx: ActiveWorkspaceContext = {
+        source: 'starter',
+        id: created.id,
+        name: created.name,
+      };
+      setWorkspaceCtx(nextCtx);
+      setAgentMessages([]);
+      setTerminalEntries([]);
+      setActiveDiffPatchId(null);
+      setView('editor');
+      setRecentWorkspaces(
+        recordRecentWorkspace({
+          id: created.id,
+          name: created.name,
+          source: 'starter',
+          lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        })
+      );
+      await refreshWorkspace(nextCtx, true);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to create folder');
+    }
+  };
+
+  const handleOpenRecent = async (item: RecentWorkspace) => {
+    try {
+      if (item.source === 'tauri-native' && item.nativeRoot) {
+        const nextCtx: ActiveWorkspaceContext = {
+          source: 'tauri-native',
+          id: item.id,
+          name: item.name,
+          nativeRoot: item.nativeRoot,
+        };
+        setWorkspaceCtx(nextCtx);
+        setAgentMessages([]);
+        setTerminalEntries([]);
+        setActiveDiffPatchId(null);
+        setView('editor');
+        setRecentWorkspaces(
+          recordRecentWorkspace({
+            ...item,
+            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          })
+        );
+        await refreshWorkspace(nextCtx, true);
+        return;
+      }
+
+      if (item.source === 'local-fs') {
+        const handle = await loadLocalDirHandle(item.id);
+        if (!handle) {
+          showNotice('info', 'Stored folder handle expired — select the folder to reopen.');
+          await handleOpenLocalFolder();
+          return;
+        }
+        const permHandle = handle as FileSystemDirectoryHandle & {
+          requestPermission?: (opts: { mode: 'read' | 'readwrite' }) => Promise<string>;
+        };
+        if (permHandle.requestPermission) {
+          const perm = await permHandle.requestPermission({ mode: 'readwrite' });
+          if (perm !== 'granted') {
+            showNotice('error', 'Folder permission was denied.');
+            return;
+          }
+        }
+        const nextCtx: ActiveWorkspaceContext = {
+          source: 'local-fs',
+          id: item.id,
+          name: item.name,
+          localDirHandle: handle,
+        };
+        setWorkspaceCtx(nextCtx);
+        setAgentMessages([]);
+        setTerminalEntries([]);
+        setActiveDiffPatchId(null);
+        setView('editor');
+        setRecentWorkspaces(
+          recordRecentWorkspace({
+            ...item,
+            lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          })
+        );
+        await refreshWorkspace(nextCtx, true);
+        return;
+      }
+
+      await handleSelectStarter(item.id);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed to reopen recent folder');
+    }
+  };
+
+  const handleSendHomeChat = async (text: string) => {
+    const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const userTurn: HomeChatMessage = {
+      id: `hc-u-${Date.now()}`,
+      role: 'user',
+      content: text,
+      timestamp: timeStr,
+    };
+    const nextHistory = [...homeChatMessages, userTurn];
+    setHomeChatMessages(nextHistory);
+    setIsHomeChatBusy(true);
+
+    try {
+      const reply = await sendHomeChat(
+        nextHistory
+          .filter((m) => !m.error)
+          .map((m) => ({ role: m.role, content: m.content }))
+      );
+      setHomeChatMessages((prev) => [
+        ...prev,
+        {
+          id: `hc-a-${Date.now()}`,
+          role: 'assistant',
+          content: reply,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
+    } catch (err) {
+      setHomeChatMessages((prev) => [
+        ...prev,
+        {
+          id: `hc-e-${Date.now()}`,
+          role: 'assistant',
+          content: '',
+          error: err instanceof Error ? err.message : 'Chat failed',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
+    } finally {
+      setIsHomeChatBusy(false);
+    }
   };
 
   const handleResetStarter = async () => {
@@ -398,11 +618,13 @@ export default function App() {
     }
   };
 
-  const handleRunAgent = async (prompt: string) => {
+  const handleRunAgent = async (prompt: string, overrideMode?: AgentMode) => {
+    const effectiveMode = overrideMode ?? agentMode;
     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const userMsg: AgentMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
+      mode: effectiveMode,
       content: prompt,
       timestamp: timeStr,
     };
@@ -422,11 +644,13 @@ export default function App() {
         tree,
         openBuffers,
         thinkingMode,
+        agentMode: effectiveMode,
       });
 
       const assistantMsg: AgentMessage = {
         id: `asst-${Date.now()}`,
         role: 'assistant',
+        mode: effectiveMode,
         content: result.summary,
         steps: result.steps,
         patches: result.patches,
@@ -569,22 +793,25 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#0F1117] text-[#E6E8EE]">
-      <TopBar
-        workspaceName={workspaceCtx.name}
-        workspaceSource={workspaceCtx.source}
-        activeWorkspaceId={workspaceCtx.id}
-        starters={starters}
-        showLeftSidebar={showLeftSidebar}
-        showRightAgent={showRightAgent}
-        showTerminal={showTerminal}
-        onToggleLeftSidebar={() => setShowLeftSidebar((p) => !p)}
-        onToggleRightAgent={() => setShowRightAgent((p) => !p)}
-        onToggleTerminal={() => setShowTerminal((p) => !p)}
-        onOpenCommandPalette={() => setPaletteOpen(true)}
-        onOpenLocalFolder={handleOpenLocalFolder}
-        onSelectStarter={handleSelectStarter}
-        onResetStarter={handleResetStarter}
-      />
+      {view === 'editor' && (
+        <TopBar
+          workspaceName={workspaceCtx.name}
+          workspaceSource={workspaceCtx.source}
+          activeWorkspaceId={workspaceCtx.id}
+          starters={starters}
+          showLeftSidebar={showLeftSidebar}
+          showRightAgent={showRightAgent}
+          showTerminal={showTerminal}
+          onToggleLeftSidebar={() => setShowLeftSidebar((p) => !p)}
+          onToggleRightAgent={() => setShowRightAgent((p) => !p)}
+          onToggleTerminal={() => setShowTerminal((p) => !p)}
+          onOpenCommandPalette={() => setPaletteOpen(true)}
+          onOpenLocalFolder={handleOpenLocalFolder}
+          onSelectStarter={handleSelectStarter}
+          onResetStarter={handleResetStarter}
+          onGoHome={() => setView('home')}
+        />
+      )}
 
       {banner && (
         <div
@@ -606,7 +833,26 @@ export default function App() {
         </div>
       )}
 
-      {/* Main 3-column workbench */}
+      {view === 'home' ? (
+        <main className="flex-1 min-h-0 overflow-hidden">
+          <HomeScreen
+            recentWorkspaces={recentWorkspaces}
+            availableWorkspaces={starters}
+            chatMessages={homeChatMessages}
+            isChatBusy={isHomeChatBusy}
+            onOpenLocalFolder={handleOpenLocalFolder}
+            onCreateNewFolder={handleCreateNewFolder}
+            onOpenRecent={handleOpenRecent}
+            onRemoveRecent={(item) =>
+              setRecentWorkspaces(removeRecentWorkspace(item.id, item.source))
+            }
+            onOpenWorkspaceSummary={(ws) => void handleSelectStarter(ws.id)}
+            onSendChat={handleSendHomeChat}
+            onClearChat={() => setHomeChatMessages([])}
+          />
+        </main>
+      ) : (
+      /* Main 3-column workbench */
       <main className="flex flex-1 min-h-0 overflow-hidden">
         {showLeftSidebar && (
           <ExplorerSidebar
@@ -780,8 +1026,10 @@ export default function App() {
             activeFilePath={activeTabPath}
             workspaceFileCount={allFilePaths.length}
             thinkingMode={thinkingMode}
+            agentMode={agentMode}
             isBusy={isAgentBusy}
             onThinkingModeChange={setThinkingMode}
+            onAgentModeChange={setAgentMode}
             onSendPrompt={handleRunAgent}
             onInspectPatch={(patch) => setActiveDiffPatchId(patch.id)}
             onAcceptPatch={handleAcceptPatch}
@@ -794,6 +1042,7 @@ export default function App() {
           />
         )}
       </main>
+      )}
 
       <CommandPalette
         open={paletteOpen}
