@@ -12,7 +12,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { HomeChatMessage, RecentWorkspace, WorkspaceSummary } from '../types/ide';
+import {
+  CreatedProjectSummary,
+  HomeChatMessage,
+  RecentWorkspace,
+  WorkspaceSummary,
+} from '../types/ide';
 import { DigitalClock } from './DigitalClock';
 
 interface HomeScreenProps {
@@ -25,14 +30,15 @@ interface HomeScreenProps {
   onOpenRecent: (item: RecentWorkspace) => void;
   onRemoveRecent: (item: RecentWorkspace) => void;
   onOpenWorkspaceSummary: (ws: WorkspaceSummary) => void;
+  onOpenCreatedProject: (project: CreatedProjectSummary) => void;
   onSendChat: (text: string) => Promise<void>;
   onClearChat: () => void;
 }
 
 const SMALLTALK_PROMPTS = [
-  'Hey! What should we build today?',
-  'Suggest a compact Rust CLI tool idea',
-  'Quick tips for optimizing Tauri memory on Linux',
+  'Create a Rust CLI project named pulse-cli with src/main.rs and Cargo.toml',
+  'Scaffold a TypeScript API starter project called edge-notes',
+  'Suggest a lightweight architecture for a Linux system monitor',
 ];
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
@@ -45,6 +51,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onOpenRecent,
   onRemoveRecent,
   onOpenWorkspaceSummary,
+  onOpenCreatedProject,
   onSendChat,
   onClearChat,
 }) => {
@@ -319,8 +326,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             {chatMessages.length === 0 ? (
               <div className="space-y-4 pt-2">
                 <p className="text-[12.5px] leading-relaxed text-[#8B92A5]">
-                  Make smalltalk, bounce an architecture idea around, or ask a quick question
-                  before opening a project.
+                  Ask Quick Chat to scaffold new projects, folders, or starter files (create-only —
+                  existing files cannot be edited here), and they will be added to your Home list
+                  automatically.
                 </p>
                 <div className="space-y-1.5">
                   {SMALLTALK_PROMPTS.map((sample) => (
@@ -337,7 +345,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               </div>
             ) : (
               chatMessages.map((msg) => (
-                <div key={msg.id} className="space-y-1">
+                <div key={msg.id} className="space-y-1.5">
                   <div className="flex items-center justify-between text-[11px] text-[#8B92A5]">
                     <span className="font-semibold text-[#E6E8EE]">
                       {msg.role === 'user' ? 'You' : 'Aetheris'}
@@ -359,6 +367,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       {msg.content}
                     </div>
                   )}
+
+                  {msg.createdProjects && msg.createdProjects.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-0.5">
+                      {msg.createdProjects.map((proj) => (
+                        <button
+                          key={`${proj.id}-${proj.name}`}
+                          type="button"
+                          onClick={() => onOpenCreatedProject(proj)}
+                          className="flex items-center gap-1.5 rounded-md border border-[#6366F1]/50 bg-[#6366F1]/15 px-2.5 py-1 text-[11.5px] font-medium text-[#C7D2FE] hover:bg-[#6366F1]/25 hover:text-white transition-colors"
+                        >
+                          <FolderPlus className="h-3.5 w-3.5 text-[#818CF8]" />
+                          <span>Open {proj.name}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))
             )}
@@ -377,7 +401,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 type="text"
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Say hello or ask anything..."
+                placeholder="Create a project, folder, file, or ask anything..."
                 className="flex-1 bg-transparent text-[12.5px] text-[#E6E8EE] placeholder-[#52596E] focus:outline-none"
               />
               <button

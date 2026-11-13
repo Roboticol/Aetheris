@@ -95,11 +95,20 @@ export interface RecentWorkspace {
   lastOpenedAt: string;
 }
 
+export interface CreatedProjectSummary {
+  id: string;
+  name: string;
+  description: string;
+  language: string;
+  rootPath?: string;
+}
+
 export interface HomeChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  createdProjects?: CreatedProjectSummary[];
   error?: string;
 }
 

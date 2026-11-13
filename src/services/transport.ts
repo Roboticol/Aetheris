@@ -2,6 +2,7 @@ import {
   AgentActivityItem,
   AgentMode,
   AgentPatch,
+  CreatedProjectSummary,
   FileNode,
   GitDiffPreview,
   GitFileChangeStatus,
@@ -457,6 +458,9 @@ export type AgentStreamEvent =
   | { type: 'activity'; activity: AgentActivityItem }
   | { type: 'thought'; delta: string };
 
+const BINARY_EXT_RE =
+  /\.(png|jpe?g|gif|webp|ico|bmp|wasm|exe|dll|so|dylib|a|o|lib|zip|tar|gz|bz2|xz|7z|pdf|woff2?|ttf|otf|eot|mp3|mp4|webm|mov|avi|ogg|flac|sqlite|db)$/i;
+
 export async function runAgentPlan(params: {
   ctx: ActiveWorkspaceContext;
   prompt: string;
@@ -487,34 +491,24 @@ export async function runAgentPlan(params: {
     signal,
     onEvent,
   } = params;
-  const candidatePaths = flattenFilePaths(tree).slice(0, 24);
 
-  const files: Array<{ path: string; content: string }> = [];
-  for (const p of candidatePaths) {
-    if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-    if (openBuffers[p] !== undefined) {
-      files.push({ path: p, content: openBuffers[p] });
-    } else {
-      try {
-        const content = await readWorkspaceFile(ctx, p);
-        files.push({ path: p, content });
-      } catch {
-        // Ignore unreadable file
-      }
-    }
-  }
+  const originalMap = new Map<string, string>(Object.entries(openBuffers));
 
   let rawResult: {
     summary: string;
     steps: string[];
-    patches: Array<{ path: string; action: string; rationale: string; content: string }>;
+    patches: Array<{
+      path: string;
+      action: string;
+      rationale: string;
+      content: string;
+      originalContent?: string;
+    }>;
     thoughts: string;
     thinkingDurationMs: number;
   };
 
-  if (ctx.source === 'tauri-native') {
+  if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
     const unlisten = await listenTauriEvent<AgentStreamEvent>('aetheris-agent-event', (evt) => {
       onEvent?.(evt);
     });
@@ -527,13 +521,20 @@ export async function runAgentPlan(params: {
       const tauriRes = await tauriInvoke<{
         summary: string;
         steps: string[];
-        patches: Array<{ path: string; action: string; rationale: string; content: string }>;
+        patches: Array<{
+          path: string;
+          action: string;
+          rationale: string;
+          content: string;
+          originalContent?: string;
+        }>;
         thoughts?: string;
         thinkingDurationMs?: number;
       }>('run_gemini_agent', {
+        root: ctx.nativeRoot,
         prompt,
         activeFile,
-        files,
+        openBuffers,
         effort,
         agentMode,
         history,
@@ -556,14 +557,44 @@ export async function runAgentPlan(params: {
       unlisten();
     }
   } else {
+    let localFiles: Array<{ path: string; content: string }> | undefined;
+    if (ctx.source === 'local-fs' && ctx.localDirHandle) {
+      localFiles = [];
+      const candidatePaths = flattenFilePaths(tree)
+        .filter((p) => !BINARY_EXT_RE.test(p))
+        .slice(0, 200);
+      for (const p of candidatePaths) {
+        if (signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        if (openBuffers[p] !== undefined) {
+          localFiles.push({ path: p, content: openBuffers[p] });
+        } else {
+          try {
+            const handle = await resolveLocalFileHandle(ctx.localDirHandle, p, false);
+            const file = await handle.getFile();
+            if (file.size <= 512_000) {
+              const content = await file.text();
+              localFiles.push({ path: p, content });
+              originalMap.set(p, content);
+            }
+          } catch {
+            // Ignore unreadable or binary files
+          }
+        }
+      }
+    }
+
     const res = await fetch('/api/agent/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
       body: JSON.stringify({
+        workspaceId: ctx.source === 'starter' ? ctx.id : undefined,
         prompt,
         activeFile,
-        files,
+        openBuffers,
+        files: localFiles,
         effort,
         agentMode,
         history,
@@ -606,7 +637,13 @@ export async function runAgentPlan(params: {
                   type: 'result';
                   summary?: string;
                   steps?: string[];
-                  patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
+                  patches?: Array<{
+                    path: string;
+                    action: string;
+                    rationale: string;
+                    content: string;
+                    originalContent?: string;
+                  }>;
                   thoughts?: string;
                   thinkingDurationMs?: number;
                 }
@@ -642,7 +679,13 @@ export async function runAgentPlan(params: {
       const data = (await res.json()) as {
         summary?: string;
         steps?: string[];
-        patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
+        patches?: Array<{
+          path: string;
+          action: string;
+          rationale: string;
+          content: string;
+          originalContent?: string;
+        }>;
         thoughts?: string;
         thinkingDurationMs?: number;
       };
@@ -656,15 +699,15 @@ export async function runAgentPlan(params: {
     }
   }
 
-  const originalMap = new Map(files.map((f) => [f.path, f.content]));
   const patches: AgentPatch[] =
     agentMode === 'plan'
       ? []
       : rawResult.patches.map((p, idx) => {
+          const baseline = p.originalContent ?? originalMap.get(p.path) ?? '';
           const normalizedAction =
             p.action === 'create' || p.action === 'delete' || p.action === 'modify'
               ? p.action
-              : originalMap.has(p.path)
+              : baseline
                 ? 'modify'
                 : 'create';
 
@@ -674,7 +717,7 @@ export async function runAgentPlan(params: {
             action: normalizedAction,
             rationale: p.rationale ?? '',
             content: p.content ?? '',
-            originalContent: originalMap.get(p.path) ?? '',
+            originalContent: baseline,
             status: 'pending',
           };
         });
@@ -749,20 +792,34 @@ export async function createTauriWorkspaceFolder(
 
 export async function sendHomeChat(
   messages: Array<{ role: 'user' | 'assistant'; content: string }>
-): Promise<string> {
+): Promise<{ reply: string; createdProjects: CreatedProjectSummary[] }> {
   if (isTauriRuntime()) {
-    return tauriInvoke<string>('chat_gemini', { messages });
+    const res = await tauriInvoke<{ reply?: string; createdProjects?: CreatedProjectSummary[] }>(
+      'chat_gemini',
+      { messages }
+    );
+    return {
+      reply: res.reply ?? '',
+      createdProjects: Array.isArray(res.createdProjects) ? res.createdProjects : [],
+    };
   }
   const res = await fetch('/api/agent/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ messages }),
   });
-  const data = (await res.json()) as { reply?: string; error?: string };
+  const data = (await res.json()) as {
+    reply?: string;
+    createdProjects?: CreatedProjectSummary[];
+    error?: string;
+  };
   if (!res.ok) {
     throw new Error(data.error ?? 'Chat request failed');
   }
-  return data.reply ?? '';
+  return {
+    reply: data.reply ?? '',
+    createdProjects: Array.isArray(data.createdProjects) ? data.createdProjects : [],
+  };
 }
 
 const RECENTS_KEY = 'aetheris.recentWorkspaces';

@@ -4,7 +4,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import {
+  GoogleGenAI,
+  ThinkingLevel,
+  Type,
+  type Content,
+  type FunctionDeclaration,
+  type Part,
+} from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -271,7 +278,13 @@ async function buildFileTree(dir: string, root: string): Promise<TreeNode[]> {
   const files: TreeNode[] = [];
 
   for (const entry of entries) {
-    if (entry.name === 'node_modules' || entry.name === 'target' || entry.name === '.git' || entry.name === 'dist') {
+    if (
+      entry.name === 'node_modules' ||
+      entry.name === 'target' ||
+      entry.name === '.git' ||
+      entry.name === 'dist' ||
+      entry.name === '.aetheris-project.json'
+    ) {
       continue;
     }
     const full = path.join(dir, entry.name);
@@ -305,7 +318,13 @@ async function searchDirectory(
 
   for (const entry of entries) {
     if (hits.length >= 150) return;
-    if (entry.name === 'node_modules' || entry.name === 'target' || entry.name === '.git' || entry.name === 'dist') {
+    if (
+      entry.name === 'node_modules' ||
+      entry.name === 'target' ||
+      entry.name === '.git' ||
+      entry.name === 'dist' ||
+      entry.name === '.aetheris-project.json'
+    ) {
       continue;
     }
     const full = path.join(dir, entry.name);
@@ -622,32 +641,47 @@ async function startServer() {
   await ensureStartersSeeded();
 
   const app = express();
-  app.use(express.json({ limit: '8mb' }));
+  app.use(express.json({ limit: '24mb' }));
 
   app.get('/api/workspaces', async (_req, res) => {
     try {
       const entries = await fs.readdir(WORKSPACES_ROOT, { withFileTypes: true });
       const starterMap = new Map(STARTER_TEMPLATES.map((t) => [t.id, t]));
-      const list = entries
-        .filter((e) => e.isDirectory())
-        .map((e) => {
-          const tpl = starterMap.get(e.name);
-          if (tpl) {
+      const list = await Promise.all(
+        entries
+          .filter((e) => e.isDirectory())
+          .map(async (e) => {
+            const tpl = starterMap.get(e.name);
+            if (tpl) {
+              return {
+                id: tpl.id,
+                name: tpl.name,
+                description: tpl.description,
+                language: tpl.language,
+              };
+            }
+            let description = 'Custom workspace folder';
+            let language = 'Folder';
+            try {
+              const metaRaw = await fs.readFile(
+                path.join(WORKSPACES_ROOT, e.name, '.aetheris-project.json'),
+                'utf-8'
+              );
+              const meta = JSON.parse(metaRaw) as { description?: string; language?: string };
+              if (meta.description) description = meta.description;
+              if (meta.language) language = meta.language;
+            } catch {
+              // No metadata file
+            }
             return {
-              id: tpl.id,
-              name: tpl.name,
-              description: tpl.description,
-              language: tpl.language,
+              id: e.name,
+              name: e.name,
+              description,
+              language,
             };
-          }
-          return {
-            id: e.name,
-            name: e.name,
-            description: 'Custom workspace folder',
-            language: 'Folder',
-          };
-        })
-        .sort((a, b) => a.name.localeCompare(b.name));
+          })
+      );
+      list.sort((a, b) => a.name.localeCompare(b.name));
       res.json({ workspaces: list });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list workspaces' });
@@ -900,16 +934,20 @@ async function startServer() {
 
     try {
       const {
+        workspaceId,
         prompt,
         activeFile,
+        openBuffers,
         files,
         effort,
         agentMode,
         history,
       } = req.body as {
+        workspaceId?: string;
         prompt: string;
         activeFile?: string | null;
-        files: Array<{ path: string; content: string }>;
+        openBuffers?: Record<string, string>;
+        files?: Array<{ path: string; content: string }>;
         effort?: 'low' | 'medium' | 'high' | 'xhigh';
         agentMode?: 'plan' | 'action';
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -928,39 +966,493 @@ async function startServer() {
       const startedAt = Date.now();
       const isPlanMode = agentMode === 'plan';
       const ai = getGeminiClient();
-      const workspaceFiles = (files ?? []).slice(0, 28);
+      const bufferMap = new Map<string, string>(Object.entries(openBuffers ?? {}));
+      const virtualMap = new Map<string, string>(
+        (files ?? []).map((f) => [f.path, f.content])
+      );
+      const useDisk = Boolean(workspaceId);
+      const workspaceRoot = workspaceId ? resolveSafeWorkspacePath(workspaceId).root : '';
 
-      // Emit initial inspection activity (Follow AI can track active/indexed files)
-      const inspectedFiles = activeFile
-        ? [activeFile, ...workspaceFiles.map((f) => f.path).filter((p) => p !== activeFile)].slice(0, 4)
-        : workspaceFiles.map((f) => f.path).slice(0, 3);
+      const listAllRelPaths = async (): Promise<string[]> => {
+        if (!useDisk) {
+          const paths = new Set<string>([...virtualMap.keys(), ...bufferMap.keys()]);
+          return Array.from(paths).sort();
+        }
+        const results: string[] = [];
+        const walk = async (dir: string, depth = 0): Promise<void> => {
+          if (depth > 12 || results.length >= 1000) return;
+          const entries = await fs.readdir(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (results.length >= 1000) return;
+            if (
+              entry.name === 'node_modules' ||
+              entry.name === 'target' ||
+              entry.name === '.git' ||
+              entry.name === 'dist' ||
+              entry.name === '.aetheris-project.json'
+            ) {
+              continue;
+            }
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+              await walk(full, depth + 1);
+            } else {
+              const rel = path.relative(workspaceRoot, full).split(path.sep).join('/');
+              results.push(rel);
+            }
+          }
+        };
+        await walk(workspaceRoot);
+        for (const p of bufferMap.keys()) {
+          if (!results.includes(p)) results.push(p);
+        }
+        return results.sort();
+      };
 
-      for (const filePath of inspectedFiles) {
-        emitEvent({
-          type: 'activity',
-          activity: {
-            id: `read-${filePath}`,
-            kind: 'read',
-            label: `Inspecting ${filePath}`,
-            filePath,
-            status: 'done',
-          },
-        });
+      const readRawFile = async (relPath: string): Promise<string | null> => {
+        if (bufferMap.has(relPath)) return bufferMap.get(relPath)!;
+        if (!useDisk) {
+          return virtualMap.get(relPath) ?? null;
+        }
+        try {
+          const { target } = resolveSafeWorkspacePath(workspaceId!, relPath);
+          return await fs.readFile(target, 'utf-8');
+        } catch {
+          return null;
+        }
+      };
+
+      interface StagedPatch {
+        path: string;
+        action: 'create' | 'modify' | 'delete';
+        rationale: string;
+        content: string;
+        originalContent: string;
       }
+      const stagedPatches = new Map<string, StagedPatch>();
+      const stepTrace: string[] = [];
+
+      const getCurrentEditableText = async (relPath: string): Promise<string | null> => {
+        const staged = stagedPatches.get(relPath);
+        if (staged) {
+          return staged.action === 'delete' ? null : staged.content;
+        }
+        return readRawFile(relPath);
+      };
+
+      const getOriginalBaseline = async (relPath: string): Promise<string> => {
+        const existingStaged = stagedPatches.get(relPath);
+        if (existingStaged) return existingStaged.originalContent;
+        return (await readRawFile(relPath)) ?? '';
+      };
+
+      const listToolDecl: FunctionDeclaration = {
+        name: 'list_workspace_files',
+        description:
+          'List all files in the workspace. Use optional directory prefix or substring filter to inspect large repositories.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            directory: {
+              type: Type.STRING,
+              description: 'Optional relative directory prefix (e.g. "src" or "src-tauri").',
+            },
+            filter: {
+              type: Type.STRING,
+              description: 'Optional case-insensitive path substring filter.',
+            },
+          },
+        },
+      };
+
+      const readToolDecl: FunctionDeclaration = {
+        name: 'read_file',
+        description:
+          'Read complete or line-ranged contents of any workspace file with line numbers. Read large files in slices (e.g. 1..400, 401..800) so nothing is missed.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            path: { type: Type.STRING, description: 'Relative file path inside workspace.' },
+            start_line: { type: Type.INTEGER, description: '1-based start line (default 1).' },
+            end_line: {
+              type: Type.INTEGER,
+              description: '1-based inclusive end line (default up to start_line + 449).',
+            },
+          },
+          required: ['path'],
+        },
+      };
+
+      const searchToolDecl: FunctionDeclaration = {
+        name: 'search_workspace',
+        description:
+          'Search across all workspace files for a text string or symbol name. Returns matching file paths, line numbers, and line previews.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: { type: Type.STRING, description: 'Text or symbol substring to search for.' },
+            case_sensitive: { type: Type.BOOLEAN, description: 'Match exact case if true.' },
+          },
+          required: ['query'],
+        },
+      };
+
+      const editToolDecl: FunctionDeclaration = {
+        name: 'propose_edit',
+        description:
+          'Propose targeted search-and-replace hunks on an existing file without rewriting unrelated parts of the file. Always read the relevant lines first so old_text matches verbatim.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            path: { type: Type.STRING, description: 'Relative path of existing file to modify.' },
+            rationale: { type: Type.STRING, description: 'Concise reason for this edit.' },
+            edits: {
+              type: Type.ARRAY,
+              description: 'Ordered list of exact search-and-replace hunks.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  old_text: {
+                    type: Type.STRING,
+                    description: 'Exact existing lines in the file to replace (must match uniquely).',
+                  },
+                  new_text: {
+                    type: Type.STRING,
+                    description: 'Replacement code for old_text.',
+                  },
+                },
+                required: ['old_text', 'new_text'],
+              },
+            },
+          },
+          required: ['path', 'rationale', 'edits'],
+        },
+      };
+
+      const createToolDecl: FunctionDeclaration = {
+        name: 'propose_create_file',
+        description: 'Stage creation of a brand new file in the workspace for diff review.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            path: { type: Type.STRING, description: 'Relative path for the new file.' },
+            rationale: { type: Type.STRING, description: 'Why this file is being created.' },
+            content: { type: Type.STRING, description: 'Complete contents of the new file.' },
+          },
+          required: ['path', 'rationale', 'content'],
+        },
+      };
+
+      const deleteToolDecl: FunctionDeclaration = {
+        name: 'propose_delete_file',
+        description: 'Stage deletion of a workspace file for review.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            path: { type: Type.STRING, description: 'Relative path of file to delete.' },
+            rationale: { type: Type.STRING, description: 'Why this file should be removed.' },
+          },
+          required: ['path', 'rationale'],
+        },
+      };
+
+      const declarations: FunctionDeclaration[] = isPlanMode
+        ? [listToolDecl, readToolDecl, searchToolDecl]
+        : [
+            listToolDecl,
+            readToolDecl,
+            searchToolDecl,
+            propose_edit_alias(editToolDecl),
+            createToolDecl,
+            deleteToolDecl,
+          ];
+
+      function propose_edit_alias(d: FunctionDeclaration): FunctionDeclaration {
+        return d;
+      }
+
+      const executeTool = async (
+        name: string,
+        args: Record<string, unknown>,
+        callIdx: number
+      ): Promise<Record<string, unknown>> => {
+        const actId = `tool-${Date.now()}-${callIdx}`;
+        if (name === 'list_workspace_files') {
+          const dirPrefix = typeof args.directory === 'string' ? args.directory.replace(/^\/+|\/+$/g, '') : '';
+          const filterStr = typeof args.filter === 'string' ? args.filter.trim().toLowerCase() : '';
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: dirPrefix ? `Listing files in ${dirPrefix}` : 'Listing workspace files',
+              status: 'running',
+            },
+          });
+          let all = await listAllRelPaths();
+          if (dirPrefix) {
+            all = all.filter((p) => p === dirPrefix || p.startsWith(`${dirPrefix}/`));
+          }
+          if (filterStr) {
+            all = all.filter((p) => p.toLowerCase().includes(filterStr));
+          }
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `Indexed ${all.length} file(s)`,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Indexed ${all.length} workspace file(s)${dirPrefix ? ` under ${dirPrefix}` : ''}`);
+          return { totalCount: all.length, files: all.slice(0, 500) };
+        }
+
+        if (name === 'read_file') {
+          const relPath = String(args.path ?? '').replace(/^\/+/, '');
+          const startLine = Math.max(1, Number(args.start_line ?? 1) || 1);
+          const requestedEnd = args.end_line ? Number(args.end_line) : startLine + 449;
+          const endLine = Math.max(startLine, Math.min(startLine + 499, requestedEnd));
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `Reading ${relPath}`,
+              filePath: relPath,
+              status: 'running',
+            },
+          });
+          const text = await getCurrentEditableText(relPath);
+          if (text === null) {
+            emitEvent({
+              type: 'activity',
+              activity: {
+                id: actId,
+                kind: 'read',
+                label: `File not found: ${relPath}`,
+                status: 'done',
+              },
+            });
+            return { error: `File not found: ${relPath}` };
+          }
+          const lines = text.split(/\r?\n/);
+          const clampedEnd = Math.min(lines.length, endLine);
+          const numbered = lines
+            .slice(startLine - 1, clampedEnd)
+            .map((l, idx) => `${startLine + idx}: ${l}`)
+            .join('\n');
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `Read ${relPath} (${startLine}-${clampedEnd}/${lines.length})`,
+              filePath: relPath,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Inspected ${relPath} (lines ${startLine}–${clampedEnd} of ${lines.length})`);
+          return {
+            path: relPath,
+            totalLines: lines.length,
+            startLine,
+            endLine: clampedEnd,
+            truncated: clampedEnd < lines.length,
+            content: numbered,
+          };
+        }
+
+        if (name === 'search_workspace') {
+          const query = String(args.query ?? '');
+          const caseSensitive = Boolean(args.case_sensitive);
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `Searching for "${query.slice(0, 32)}"`,
+              status: 'running',
+            },
+          });
+          const all = await listAllRelPaths();
+          const needle = caseSensitive ? query : query.toLowerCase();
+          const matches: Array<{ path: string; line: number; text: string }> = [];
+          for (const relPath of all) {
+            if (matches.length >= 80) break;
+            const raw = await readRawFile(relPath);
+            if (!raw) continue;
+            const lines = raw.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+              if (matches.length >= 80) break;
+              const hay = caseSensitive ? lines[i] : lines[i].toLowerCase();
+              if (hay.includes(needle)) {
+                matches.push({ path: relPath, line: i + 1, text: lines[i].trim().slice(0, 160) });
+              }
+            }
+          }
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `Search "${query.slice(0, 24)}" -> ${matches.length} hit(s)`,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Searched workspace for "${query}" (${matches.length} matches)`);
+          return { matchCount: matches.length, matches };
+        }
+
+        if (name === 'propose_edit' && !isPlanMode) {
+          const relPath = String(args.path ?? '').replace(/^\/+/, '');
+          const rationale = String(args.rationale ?? 'Update file');
+          const edits = Array.isArray(args.edits)
+            ? (args.edits as Array<{ old_text?: string; new_text?: string }>)
+            : [];
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'edit',
+              label: `Editing ${relPath}`,
+              filePath: relPath,
+              status: 'running',
+            },
+          });
+
+          const current = await getCurrentEditableText(relPath);
+          if (current === null) {
+            return { error: `Cannot edit "${relPath}" because it does not exist. Use propose_create_file instead.` };
+          }
+          const baseline = await getOriginalBaseline(relPath);
+          let nextContent = current;
+
+          for (let i = 0; i < edits.length; i++) {
+            const oldText = typeof edits[i]?.old_text === 'string' ? edits[i].old_text! : '';
+            const newText = typeof edits[i]?.new_text === 'string' ? edits[i].new_text! : '';
+            if (!oldText) {
+              return { error: `Edit #${i + 1} has empty old_text. Call read_file to copy exact lines.` };
+            }
+
+            let occurrences = nextContent.split(oldText).length - 1;
+            let resolvedOld = oldText;
+            let resolvedNew = newText;
+
+            if (occurrences === 0 && nextContent.includes('\r\n')) {
+              const crlfOld = oldText.replace(/\r?\n/g, '\r\n');
+              const crlfNew = newText.replace(/\r?\n/g, '\r\n');
+              const crlfOcc = nextContent.split(crlfOld).length - 1;
+              if (crlfOcc > 0) {
+                resolvedOld = crlfOld;
+                resolvedNew = crlfNew;
+                occurrences = crlfOcc;
+              }
+            }
+
+            if (occurrences === 0) {
+              return {
+                error: `Edit #${i + 1} old_text not found in "${relPath}". Call read_file on "${relPath}" to verify exact whitespace and lines.`,
+              };
+            }
+            if (occurrences > 1) {
+              return {
+                error: `Edit #${i + 1} old_text matched ${occurrences} places in "${relPath}". Include 2-3 surrounding context lines so it is unique.`,
+              };
+            }
+
+            nextContent = nextContent.replace(resolvedOld, () => resolvedNew);
+          }
+
+          stagedPatches.set(relPath, {
+            path: relPath,
+            action: stagedPatches.get(relPath)?.action === 'create' ? 'create' : 'modify',
+            rationale,
+            content: nextContent,
+            originalContent: baseline,
+          });
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'edit',
+              label: `Staged edit -> ${relPath}`,
+              filePath: relPath,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Proposed ${edits.length} targeted edit(s) in ${relPath}`);
+          return { ok: true, path: relPath, appliedEdits: edits.length };
+        }
+
+        if (name === 'propose_create_file' && !isPlanMode) {
+          const relPath = String(args.path ?? '').replace(/^\/+/, '');
+          const rationale = String(args.rationale ?? 'Create new file');
+          const content = String(args.content ?? '');
+          const baseline = await getOriginalBaseline(relPath);
+          stagedPatches.set(relPath, {
+            path: relPath,
+            action: baseline ? 'modify' : 'create',
+            rationale,
+            content,
+            originalContent: baseline,
+          });
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'edit',
+              label: `Staged new file -> ${relPath}`,
+              filePath: relPath,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Proposed new file ${relPath}`);
+          return { ok: true, path: relPath };
+        }
+
+        if (name === 'propose_delete_file' && !isPlanMode) {
+          const relPath = String(args.path ?? '').replace(/^\/+/, '');
+          const rationale = String(args.rationale ?? 'Remove file');
+          const baseline = await getOriginalBaseline(relPath);
+          stagedPatches.set(relPath, {
+            path: relPath,
+            action: 'delete',
+            rationale,
+            content: '',
+            originalContent: baseline,
+          });
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'edit',
+              label: `Staged deletion -> ${relPath}`,
+              filePath: relPath,
+              status: 'done',
+            },
+          });
+          stepTrace.push(`Proposed removal of ${relPath}`);
+          return { ok: true, path: relPath };
+        }
+
+        return { error: `Unknown or disallowed tool: ${name}` };
+      };
+
+      const allPaths = await listAllRelPaths();
+      const previewTreeList = allPaths.slice(0, 120).join('\n');
+      const activePreview = activeFile ? await readRawFile(activeFile) : null;
 
       emitEvent({
         type: 'activity',
         activity: {
           id: 'phase-think',
           kind: 'think',
-          label: isPlanMode ? 'Analyzing architecture & plan' : 'Reasoning over workspace edits',
+          label: isPlanMode ? 'Analyzing architecture & plan' : 'Inspecting workspace with tools',
           status: 'running',
         },
       });
-
-      const contextFiles = workspaceFiles
-        .map((f) => `--- FILE: ${f.path} ---\n${f.content.slice(0, 18000)}`)
-        .join('\n\n');
 
       const thinkingLevel =
         effort === 'xhigh'
@@ -971,11 +1463,14 @@ async function startServer() {
               ? ThinkingLevel.LOW
               : ThinkingLevel.MEDIUM;
 
-      const systemInstruction = isPlanMode
-        ? 'You are Aetheris in PLAN MODE (read-only architectural and implementation planning). Inspect the provided workspace files carefully and produce a concrete, step-by-step engineering plan explaining which files, functions, and data flows should change and why. Do NOT emit file edits in Plan Mode: always return an empty patches array [].'
-        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding). Inspect the provided workspace files carefully. Respond with a concise engineering summary, clear verification/inspection steps you took, and structured multi-file patches. Whenever creating or modifying a file, provide the COMPLETE updated file content (never truncate with ellipses or placeholders).';
+      const maxTurns =
+        effort === 'xhigh' ? 24 : effort === 'high' ? 18 : effort === 'low' ? 8 : 14;
 
-      const priorTurns = (history ?? [])
+      const systemInstruction = isPlanMode
+        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Output a clear technical summary followed by numbered concrete steps citing exact file paths and symbols.'
+        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. After staging all edits, conclude with a concise summary and ordered verification steps.';
+
+      const priorTurns: Content[] = (history ?? [])
         .filter((h) => h.content && h.content.trim())
         .slice(-10)
         .map((h) => ({
@@ -983,128 +1478,114 @@ async function startServer() {
           parts: [{ text: h.content.slice(0, 4000) }],
         }));
 
-      const currentTurnText = `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (generate patches)'}\nActive editor file: ${activeFile ?? 'none'}\n\nUser request:\n${prompt}\n\nWorkspace context:\n${contextFiles}`;
+      const activeSnippet =
+        activePreview !== null
+          ? `\nActive editor file (${activeFile}, ${activePreview.split(/\r?\n/).length} lines) — use read_file for full or other files.`
+          : '';
 
-      const contents = [
+      const initialPrompt = `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (tool-based edits)'}\nActive editor file: ${activeFile ?? 'none'}${activeSnippet}\nTotal workspace files: ${allPaths.length}\nFiles overview (call list_workspace_files for full list if needed):\n${previewTreeList}\n\nUser request:\n${prompt}`;
+
+      const contents: Content[] = [
         ...priorTurns,
-        { role: 'user', parts: [{ text: currentTurnText }] },
+        { role: 'user', parts: [{ text: initialPrompt }] },
       ];
 
-      const stream = await ai.models.generateContentStream({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          abortSignal: abortController.signal,
-          systemInstruction,
-          thinkingConfig: {
-            thinkingLevel,
-            includeThoughts: true,
-          },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              summary: {
-                type: Type.STRING,
-                description: isPlanMode
-                  ? 'Clear architectural analysis and implementation plan overview.'
-                  : 'Clear, concise technical explanation of findings and proposed edits.',
-              },
-              steps: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: isPlanMode
-                  ? 'Concrete ordered implementation steps referencing exact file paths and symbols.'
-                  : 'Ordered trace of workspace inspection and editing steps.',
-              },
-              patches: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    path: { type: Type.STRING, description: 'Relative workspace path.' },
-                    action: { type: Type.STRING, description: 'One of: create, modify, delete' },
-                    rationale: { type: Type.STRING, description: 'Why this file change is needed.' },
-                    content: { type: Type.STRING, description: 'Complete file contents for create or modify; empty string for delete.' },
-                  },
-                  required: ['path', 'action', 'rationale', 'content'],
-                },
-              },
-            },
-            required: ['summary', 'steps', 'patches'],
-          },
-        },
-      });
-
-      let rawAnswer = '';
+      let finalAnswerText = '';
       let thoughtsAccum = '';
       let thoughtStartMs: number | null = null;
       let thoughtEndMs: number | null = null;
-      let emittedDrafting = false;
-      const seenEditPaths = new Set<string>();
 
-      for await (const chunk of stream) {
+      for (let turn = 0; turn < maxTurns; turn++) {
         if (clientClosed || abortController.signal.aborted) break;
 
-        const parts = chunk.candidates?.[0]?.content?.parts ?? [];
-        for (const part of parts) {
-          const textPiece = typeof part.text === 'string' ? part.text : '';
-          if (!textPiece) continue;
+        const stream = await ai.models.generateContentStream({
+          model: 'gemini-4-hydrogen',
+          contents,
+          config: {
+            abortSignal: abortController.signal,
+            systemInstruction,
+            thinkingConfig: {
+              thinkingLevel,
+              includeThoughts: true,
+            },
+            tools: [{ functionDeclarations: declarations }],
+          },
+        });
 
-          if ((part as { thought?: boolean }).thought) {
-            if (thoughtStartMs === null) thoughtStartMs = Date.now();
-            thoughtEndMs = Date.now();
-            thoughtsAccum += textPiece;
-            emitEvent({ type: 'thought', delta: textPiece });
-          } else {
-            if (!emittedDrafting) {
-              emittedDrafting = true;
-              if (thoughtStartMs !== null && thoughtEndMs === null) {
+        const modelParts: Part[] = [];
+        const functionCalls: Array<{ id?: string; name: string; args: Record<string, unknown> }> = [];
+        let turnText = '';
+
+        for await (const chunk of stream) {
+          if (clientClosed || abortController.signal.aborted) break;
+
+          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+          for (const part of parts) {
+            const pAny = part as Part & { thought?: boolean; thoughtSignature?: string };
+            const textPiece = typeof pAny.text === 'string' ? pAny.text : '';
+
+            if (pAny.thought) {
+              if (textPiece) {
+                if (thoughtStartMs === null) thoughtStartMs = Date.now();
                 thoughtEndMs = Date.now();
+                thoughtsAccum += textPiece;
+                emitEvent({ type: 'thought', delta: textPiece });
               }
-              emitEvent({
-                type: 'activity',
-                activity: {
-                  id: 'phase-think',
-                  kind: 'think',
-                  label: isPlanMode ? 'Analyzed architecture & plan' : 'Finished reasoning',
-                  status: 'done',
-                },
-              });
-              emitEvent({
-                type: 'activity',
-                activity: {
-                  id: 'phase-draft',
-                  kind: isPlanMode ? 'plan' : 'edit',
-                  label: isPlanMode ? 'Writing step-by-step plan' : 'Drafting workspace patches',
-                  status: 'running',
-                },
-              });
+              continue;
             }
 
-            rawAnswer += textPiece;
-
-            if (!isPlanMode) {
-              const pathMatches = rawAnswer.matchAll(/"path"\s*:\s*"([^"\\]+)"/g);
-              for (const m of pathMatches) {
-                const patchedPath = m[1];
-                if (patchedPath && !seenEditPaths.has(patchedPath)) {
-                  seenEditPaths.add(patchedPath);
-                  emitEvent({
-                    type: 'activity',
-                    activity: {
-                      id: `edit-${patchedPath}`,
-                      kind: 'edit',
-                      label: `Preparing edit -> ${patchedPath}`,
-                      filePath: patchedPath,
-                      status: 'done',
-                    },
-                  });
-                }
+            if (pAny.functionCall) {
+              modelParts.push(part);
+              functionCalls.push({
+                id: pAny.functionCall.id,
+                name: pAny.functionCall.name ?? '',
+                args: (pAny.functionCall.args as Record<string, unknown>) ?? {},
+              });
+            } else if (textPiece || pAny.thoughtSignature) {
+              if (textPiece) turnText += textPiece;
+              const last = modelParts[modelParts.length - 1] as
+                | (Part & { thoughtSignature?: string })
+                | undefined;
+              if (
+                last &&
+                typeof last.text === 'string' &&
+                !last.functionCall &&
+                !last.thoughtSignature &&
+                !pAny.thoughtSignature
+              ) {
+                last.text += textPiece;
+              } else {
+                modelParts.push({ ...part });
               }
             }
           }
         }
+
+        if (clientClosed || abortController.signal.aborted) break;
+
+        if (modelParts.length > 0) {
+          contents.push({ role: 'model', parts: modelParts });
+        }
+
+        if (functionCalls.length === 0) {
+          finalAnswerText = turnText.trim();
+          break;
+        }
+
+        const responseParts: Part[] = [];
+        for (let i = 0; i < functionCalls.length; i++) {
+          const fc = functionCalls[i];
+          const toolOut = await executeTool(fc.name, fc.args, i + turn * 20);
+          responseParts.push({
+            functionResponse: {
+              id: fc.id,
+              name: fc.name,
+              response: toolOut,
+            },
+          });
+        }
+
+        contents.push({ role: 'user', parts: responseParts });
       }
 
       if (clientClosed || abortController.signal.aborted) {
@@ -1112,23 +1593,27 @@ async function startServer() {
         return;
       }
 
-      const parsed = JSON.parse((rawAnswer || '{}').trim()) as {
-        summary?: string;
-        steps?: string[];
-        patches?: Array<{ path: string; action: string; rationale: string; content: string }>;
-      };
-
+      const patches = isPlanMode ? [] : Array.from(stagedPatches.values());
       const thinkingDurationMs =
         thoughtStartMs !== null
           ? Math.max(200, (thoughtEndMs ?? Date.now()) - thoughtStartMs)
           : Date.now() - startedAt;
+
+      const parsedSteps = finalAnswerText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => /^\d+\.\s+/.test(line))
+        .map((line) => line.replace(/^\d+\.\s+/, ''))
+        .slice(0, 12);
+
+      const finalSteps = parsedSteps.length > 0 ? parsedSteps : Array.from(new Set(stepTrace)).slice(0, 12);
 
       emitEvent({
         type: 'activity',
         activity: {
           id: 'phase-think',
           kind: 'think',
-          label: isPlanMode ? 'Analyzed architecture & plan' : 'Completed reasoning',
+          label: isPlanMode ? 'Analyzed architecture & plan' : 'Completed workspace execution',
           status: 'done',
         },
       });
@@ -1137,16 +1622,22 @@ async function startServer() {
         activity: {
           id: 'phase-draft',
           kind: 'done',
-          label: isPlanMode ? 'Plan ready' : `Prepared ${Array.isArray(parsed.patches) ? parsed.patches.length : 0} file change(s)`,
+          label: isPlanMode
+            ? 'Plan ready'
+            : `Prepared ${patches.length} file change(s)`,
           status: 'done',
         },
       });
 
       emitEvent({
         type: 'result',
-        summary: parsed.summary ?? 'Completed workspace analysis.',
-        steps: Array.isArray(parsed.steps) ? parsed.steps : [],
-        patches: isPlanMode ? [] : Array.isArray(parsed.patches) ? parsed.patches : [],
+        summary:
+          finalAnswerText ||
+          (patches.length > 0
+            ? `Prepared ${patches.length} file change(s) for review.`
+            : 'Completed workspace analysis.'),
+        steps: finalSteps,
+        patches,
         thoughts: thoughtsAccum.trim(),
         thinkingDurationMs,
       });
@@ -1179,22 +1670,240 @@ async function startServer() {
       }
 
       const ai = getGeminiClient();
-      const contents = cleaned.slice(-16).map((m) => ({
+      const createdProjectsMap = new Map<
+        string,
+        { id: string; name: string; description: string; language: string }
+      >();
+
+      const createProjectDecl: FunctionDeclaration = {
+        name: 'create_project',
+        description:
+          'Create a brand-new starter project workspace with folders and starter files. Automatically registers it on the Home screen project list. Create-only: never overwrites existing files.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            project_name: {
+              type: Type.STRING,
+              description: 'Slug folder name (letters, numbers, hyphens, underscores).',
+            },
+            description: { type: Type.STRING, description: 'Short 1-line project summary.' },
+            language: { type: Type.STRING, description: 'Primary language (e.g. Rust, TypeScript, Python).' },
+            folders: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description: 'Optional relative folder paths to create inside the project.',
+            },
+            files: {
+              type: Type.ARRAY,
+              description: 'Starter files to create inside the project.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  path: { type: Type.STRING, description: 'Relative path inside project.' },
+                  content: { type: Type.STRING, description: 'Initial file content.' },
+                },
+                required: ['path', 'content'],
+              },
+            },
+          },
+          required: ['project_name', 'description', 'language', 'files'],
+        },
+      };
+
+      const createFolderDecl: FunctionDeclaration = {
+        name: 'create_folder',
+        description:
+          'Create a new folder inside a project workspace (creates the project if it is new). Does not modify or delete existing files.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            project_name: { type: Type.STRING, description: 'Project directory slug.' },
+            folder_path: { type: Type.STRING, description: 'Relative folder path inside project.' },
+          },
+          required: ['project_name', 'folder_path'],
+        },
+      };
+
+      const createFileDecl: FunctionDeclaration = {
+        name: 'create_file',
+        description:
+          'Create a NEW file inside a project workspace. Strictly create-only: fails if the file already exists (Quick Chat cannot edit existing files).',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            project_name: { type: Type.STRING, description: 'Project directory slug.' },
+            file_path: { type: Type.STRING, description: 'Relative file path inside project.' },
+            content: { type: Type.STRING, description: 'Initial content for the new file.' },
+          },
+          required: ['project_name', 'file_path', 'content'],
+        },
+      };
+
+      const sanitizeProjectSlug = (raw: string): string => {
+        const slug = raw
+          .trim()
+          .replace(/[^a-zA-Z0-9_-]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+        if (!slug) throw new Error('Project name must contain letters or numbers.');
+        return slug;
+      };
+
+      const ensureProjectRegistered = async (
+        slug: string,
+        description = 'Project created via Quick Chat',
+        language = 'Folder'
+      ) => {
+        const { root } = resolveSafeWorkspacePath(slug);
+        let existed = true;
+        try {
+          await fs.access(root);
+        } catch {
+          existed = false;
+        }
+        await fs.mkdir(root, { recursive: true });
+        if (!existed) {
+          await fs.writeFile(
+            path.join(root, '.aetheris-project.json'),
+            JSON.stringify({ description, language }, null, 2),
+            'utf-8'
+          );
+        }
+        createdProjectsMap.set(slug, { id: slug, name: slug, description, language });
+        return { root, existed };
+      };
+
+      const runQuickChatTool = async (
+        name: string,
+        args: Record<string, unknown>
+      ): Promise<Record<string, unknown>> => {
+        try {
+          if (name === 'create_project') {
+            const slug = sanitizeProjectSlug(String(args.project_name ?? ''));
+            const description = String(args.description ?? 'Project created via Quick Chat').slice(0, 120);
+            const language = String(args.language ?? 'Folder').slice(0, 40);
+            const folders = Array.isArray(args.folders) ? (args.folders as string[]) : [];
+            const files = Array.isArray(args.files)
+              ? (args.files as Array<{ path?: string; content?: string }>)
+              : [];
+
+            const { root, existed } = await ensureProjectRegistered(slug, description, language);
+            if (existed) {
+              return {
+                error: `Project "${slug}" already exists. Quick Chat only creates new projects/files and cannot overwrite existing projects.`,
+              };
+            }
+
+            for (const folder of folders) {
+              const { target } = resolveSafeWorkspacePath(slug, String(folder));
+              await fs.mkdir(target, { recursive: true });
+            }
+
+            const createdFiles: string[] = [];
+            for (const f of files) {
+              const rel = String(f.path ?? '').replace(/^\/+/, '');
+              if (!rel) continue;
+              const { target } = resolveSafeWorkspacePath(slug, rel);
+              await fs.mkdir(path.dirname(target), { recursive: true });
+              await fs.writeFile(target, String(f.content ?? ''), { encoding: 'utf-8', flag: 'wx' });
+              createdFiles.push(rel);
+            }
+
+            if (createdFiles.length === 0) {
+              await fs.writeFile(
+                path.join(root, 'README.md'),
+                `# ${slug}\n\n${description}\n`,
+                { encoding: 'utf-8', flag: 'wx' }
+              );
+              createdFiles.push('README.md');
+            }
+
+            return { ok: true, project: slug, createdFiles };
+          }
+
+          if (name === 'create_folder') {
+            const slug = sanitizeProjectSlug(String(args.project_name ?? ''));
+            const folderPath = String(args.folder_path ?? '').replace(/^\/+/, '');
+            await ensureProjectRegistered(slug);
+            const { target } = resolveSafeWorkspacePath(slug, folderPath);
+            await fs.mkdir(target, { recursive: true });
+            return { ok: true, project: slug, folder: folderPath };
+          }
+
+          if (name === 'create_file') {
+            const slug = sanitizeProjectSlug(String(args.project_name ?? ''));
+            const rel = String(args.file_path ?? '').replace(/^\/+/, '');
+            const content = String(args.content ?? '');
+            await ensureProjectRegistered(slug);
+            const { target } = resolveSafeWorkspacePath(slug, rel);
+            await fs.mkdir(path.dirname(target), { recursive: true });
+            try {
+              await fs.writeFile(target, content, { encoding: 'utf-8', flag: 'wx' });
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') {
+                return {
+                  error: `Permission denied: "${rel}" already exists. Quick Chat has create-only permissions and cannot edit existing files.`,
+                };
+              }
+              throw err;
+            }
+            return { ok: true, project: slug, file: rel };
+          }
+
+          return { error: `Unknown tool: ${name}` };
+        } catch (err) {
+          return { error: err instanceof Error ? err.message : 'Tool failed' };
+        }
+      };
+
+      const contents: Content[] = cleaned.slice(-16).map((m) => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: m.content }],
       }));
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          systemInstruction:
-            'You are Aetheris, a friendly, concise engineering companion on the IDE home screen. Chat naturally for smalltalk, brainstorm ideas, or answer quick technical questions concisely.',
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      });
+      let replyText = '';
+      for (let turn = 0; turn < 8; turn++) {
+        const response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents,
+          config: {
+            systemInstruction:
+              'You are Aetheris Quick Chat on the Home Screen. You help users brainstorm or start new projects. PERMISSIONS: You have CREATE-ONLY permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list.',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            tools: [{ functionDeclarations: [createProjectDecl, createFolderDecl, createFileDecl] }],
+          },
+        });
 
-      res.json({ reply: (response.text ?? '').trim() || 'No response returned.' });
+        const candidateContent = response.candidates?.[0]?.content;
+        const calls = response.functionCalls ?? [];
+        if (candidateContent) {
+          contents.push(candidateContent);
+        }
+        if (calls.length === 0) {
+          replyText = (response.text ?? '').trim();
+          break;
+        }
+
+        const respParts: Part[] = [];
+        for (const call of calls) {
+          const result = await runQuickChatTool(
+            call.name ?? '',
+            (call.args as Record<string, unknown>) ?? {}
+          );
+          respParts.push({
+            functionResponse: {
+              id: call.id,
+              name: call.name ?? '',
+              response: result,
+            },
+          });
+        }
+        contents.push({ role: 'user', parts: respParts });
+      }
+
+      res.json({
+        reply: replyText || 'Done.',
+        createdProjects: Array.from(createdProjectsMap.values()),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Chat request failed';
       res.status(500).json({ error: message });

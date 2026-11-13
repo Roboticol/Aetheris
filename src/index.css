@@ -3,6 +3,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
+  color-scheme: dark;
   --background: #0F1117;
   --surface: #161922;
   --surface-elevated: #1E222E;
@@ -65,6 +66,36 @@ pre,
   background: rgba(139, 146, 165, 0.4);
   border: 2px solid transparent;
   background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner,
+.cm-scroller::-webkit-scrollbar-corner,
+.cm-editor ::-webkit-scrollbar-corner {
+  background: #0F1117 !important;
+  background-color: #0F1117 !important;
+}
+
+.cm-scroller {
+  scrollbar-color: rgba(139, 146, 165, 0.25) #0F1117;
+}
+
+.cm-scroller::-webkit-scrollbar-track {
+  background: #0F1117;
+}
+
+/* Keep editor tab strip height locked even when horizontal scrolling activates */
+.tab-strip {
+  scrollbar-width: none;
+}
+
+.tab-strip::-webkit-scrollbar {
+  height: 2px;
+}
+
+.tab-strip::-webkit-scrollbar-thumb {
+  background: rgba(129, 140, 248, 0.45);
+  border: none;
+  border-radius: 0;
 }
 
 /* CodeMirror 6 VS Code-style integration styling */

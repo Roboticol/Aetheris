@@ -1,7 +1,9 @@
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -41,20 +43,14 @@ pub struct TerminalOutput {
     pub exit_code: i32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentFileContext {
-    pub path: String,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPatch {
     pub path: String,
     pub action: String,
     pub rationale: String,
     pub content: String,
+    pub original_content: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +61,23 @@ pub struct AgentPlanResponse {
     pub patches: Vec<AgentPatch>,
     pub thoughts: String,
     pub thinking_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedProjectSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub root_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickChatResponse {
+    pub reply: String,
+    pub created_projects: Vec<CreatedProjectSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +416,46 @@ pub struct ChatTurnInput {
     pub content: String,
 }
 
+fn sanitize_project_slug(raw: &str) -> Result<String, String> {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            slug.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !slug.is_empty() {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        return Err("Project name must contain letters or numbers.".into());
+    }
+    Ok(trimmed)
+}
+
+fn quick_chat_projects_root() -> PathBuf {
+    dirs::home_dir()
+        .or_else(dirs::document_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("AetherisProjects")
+}
+
+fn write_new_file_only(target: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(target) {
+        Ok(mut file) => file.write_all(content.as_bytes()).map_err(|e| e.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "Permission denied: \"{}\" already exists. Quick Chat has create-only permissions and cannot edit existing files.",
+            target.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 #[tauri::command]
 fn create_new_workspace_dir(parent_dir: String, name: String) -> Result<String, String> {
     let trimmed = name.trim();
@@ -415,12 +468,18 @@ fn create_new_workspace_dir(parent_dir: String, name: String) -> Result<String, 
 }
 
 #[tauri::command]
-async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<String, String> {
+async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<QuickChatResponse, String> {
     let api_key = resolve_gemini_api_key()?;
     let client = reqwest::Client::new();
 
-    let contents: Vec<serde_json::Value> = messages
+    let mut contents: Vec<serde_json::Value> = messages
         .into_iter()
+        .filter(|m| !m.content.trim().is_empty())
+        .rev()
+        .take(16)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .map(|m| {
             let role = if m.role == "assistant" { "model" } else { "user" };
             serde_json::json!({
@@ -430,42 +489,332 @@ async fn chat_gemini(messages: Vec<ChatTurnInput>) -> Result<String, String> {
         })
         .collect();
 
-    let body = serde_json::json!({
-        "systemInstruction": {
-            "parts": [{
-                "text": "You are Aetheris, a friendly, concise coding companion inside a lightweight Rust-native IDE. Answer quick questions, chat naturally, or help brainstorm ideas cleanly."
-            }]
-        },
-        "contents": contents,
-        "generationConfig": {
-            "thinkingConfig": { "thinkingLevel": "LOW" }
-        }
-    });
+    if contents.is_empty() {
+        return Err("Message cannot be empty.".into());
+    }
+
+    let tools = serde_json::json!([{
+        "functionDeclarations": [
+            {
+                "name": "create_project",
+                "description": "Create a brand-new project workspace under ~/AetherisProjects with folders and starter files. Automatically registers it on the Home screen project list. Create-only: never overwrites existing files.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "project_name": { "type": "STRING", "description": "Slug folder name (letters, numbers, hyphens, underscores)." },
+                        "description": { "type": "STRING", "description": "Short 1-line project summary." },
+                        "language": { "type": "STRING", "description": "Primary language (e.g. Rust, TypeScript, Python)." },
+                        "folders": {
+                            "type": "ARRAY",
+                            "items": { "type": "STRING" },
+                            "description": "Optional relative folder paths inside the project."
+                        },
+                        "files": {
+                            "type": "ARRAY",
+                            "description": "Starter files to create inside the project.",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "path": { "type": "STRING", "description": "Relative path inside project." },
+                                    "content": { "type": "STRING", "description": "Initial file content." }
+                                },
+                                "required": ["path", "content"]
+                            }
+                        }
+                    },
+                    "required": ["project_name", "description", "language", "files"]
+                }
+            },
+            {
+                "name": "create_folder",
+                "description": "Create a new folder inside a project workspace (creates the project if new). Does not modify or delete existing files.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "project_name": { "type": "STRING", "description": "Project directory slug." },
+                        "folder_path": { "type": "STRING", "description": "Relative folder path inside project." }
+                    },
+                    "required": ["project_name", "folder_path"]
+                }
+            },
+            {
+                "name": "create_file",
+                "description": "Create a NEW file inside a project workspace. Strictly create-only: fails if the file already exists.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "project_name": { "type": "STRING", "description": "Project directory slug." },
+                        "file_path": { "type": "STRING", "description": "Relative file path inside project." },
+                        "content": { "type": "STRING", "description": "Initial content for the new file." }
+                    },
+                    "required": ["project_name", "file_path", "content"]
+                }
+            }
+        ]
+    }]);
 
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={}",
         api_key
     );
 
-    let res = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error contacting Gemini API: {}", e))?;
+    let base_root = quick_chat_projects_root();
+    let mut created_map: HashMap<String, CreatedProjectSummary> = HashMap::new();
+    let mut created_order: Vec<String> = Vec::new();
+    let mut reply_text = String::new();
 
-    if !res.status().is_success() {
-        let txt = res.text().await.unwrap_or_default();
-        return Err(format!("Gemini API error: {}", txt));
+    for _turn in 0..8 {
+        let body = serde_json::json!({
+            "systemInstruction": {
+                "parts": [{
+                    "text": "You are Aetheris Quick Chat on the Home Screen. You help users brainstorm or start new projects. PERMISSIONS: You have CREATE-ONLY permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list."
+                }]
+            },
+            "contents": contents,
+            "tools": tools,
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "LOW" }
+            }
+        });
+
+        let res = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Network error contacting Gemini API: {}", e))?;
+
+        if !res.status().is_success() {
+            let txt = res.text().await.unwrap_or_default();
+            return Err(format!("Gemini API error: {}", txt));
+        }
+
+        let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        let candidate_content = json["candidates"][0]["content"].clone();
+        let parts = candidate_content["parts"].as_array().cloned().unwrap_or_default();
+
+        if !candidate_content.is_null() {
+            contents.push(candidate_content);
+        }
+
+        let mut function_calls: Vec<serde_json::Value> = Vec::new();
+        let mut text_parts: Vec<String> = Vec::new();
+
+        for part in &parts {
+            if part.get("functionCall").is_some() {
+                function_calls.push(part["functionCall"].clone());
+            } else if part["thought"].as_bool() != Some(true) {
+                if let Some(t) = part["text"].as_str() {
+                    if !t.is_empty() {
+                        text_parts.push(t.to_string());
+                    }
+                }
+            }
+        }
+
+        if function_calls.is_empty() {
+            reply_text = text_parts.join("").trim().to_string();
+            break;
+        }
+
+        let mut resp_parts: Vec<serde_json::Value> = Vec::new();
+        for fc in function_calls {
+            let fc_name = fc["name"].as_str().unwrap_or("");
+            let fc_args = &fc["args"];
+            let tool_result: serde_json::Value = match fc_name {
+                "create_project" => {
+                    let raw_name = fc_args["project_name"].as_str().unwrap_or("");
+                    match sanitize_project_slug(raw_name) {
+                        Err(e) => serde_json::json!({ "error": e }),
+                        Ok(slug) => {
+                            let proj_dir = base_root.join(&slug);
+                            if proj_dir.exists() {
+                                serde_json::json!({
+                                    "error": format!("Project \"{}\" already exists. Quick Chat only creates new projects/files and cannot overwrite existing projects.", slug)
+                                })
+                            } else if let Err(e) = fs::create_dir_all(&proj_dir) {
+                                serde_json::json!({ "error": e.to_string() })
+                            } else {
+                                let desc = fc_args["description"]
+                                    .as_str()
+                                    .unwrap_or("Project created via Quick Chat")
+                                    .chars()
+                                    .take(120)
+                                    .collect::<String>();
+                                let lang = fc_args["language"]
+                                    .as_str()
+                                    .unwrap_or("Folder")
+                                    .chars()
+                                    .take(40)
+                                    .collect::<String>();
+
+                                if let Some(folders) = fc_args["folders"].as_array() {
+                                    for folder in folders {
+                                        if let Some(f_str) = folder.as_str() {
+                                            if let Ok(target) = sanitize_relative_path(&proj_dir, f_str.trim_start_matches('/')) {
+                                                let _ = fs::create_dir_all(target);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let mut created_files: Vec<String> = Vec::new();
+                                let mut create_err: Option<String> = None;
+                                if let Some(files) = fc_args["files"].as_array() {
+                                    for f in files {
+                                        let rel = f["path"].as_str().unwrap_or("").trim_start_matches('/');
+                                        if rel.is_empty() {
+                                            continue;
+                                        }
+                                        let content = f["content"].as_str().unwrap_or("");
+                                        match sanitize_relative_path(&proj_dir, rel) {
+                                            Ok(target) => {
+                                                if let Err(e) = write_new_file_only(&target, content) {
+                                                    create_err = Some(e);
+                                                    break;
+                                                }
+                                                created_files.push(rel.to_string());
+                                            }
+                                            Err(e) => {
+                                                create_err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(err) = create_err {
+                                    serde_json::json!({ "error": err })
+                                } else {
+                                    if created_files.is_empty() {
+                                        let readme = proj_dir.join("README.md");
+                                        let _ = write_new_file_only(&readme, &format!("# {}\n\n{}\n", slug, desc));
+                                        created_files.push("README.md".into());
+                                    }
+                                    let root_str = proj_dir.to_string_lossy().to_string();
+                                    if !created_map.contains_key(&slug) {
+                                        created_order.push(slug.clone());
+                                    }
+                                    created_map.insert(
+                                        slug.clone(),
+                                        CreatedProjectSummary {
+                                            id: root_str.clone(),
+                                            name: slug.clone(),
+                                            description: desc,
+                                            language: lang,
+                                            root_path: Some(root_str.clone()),
+                                        },
+                                    );
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "project": slug,
+                                        "rootPath": root_str,
+                                        "createdFiles": created_files
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
+                "create_folder" => {
+                    let raw_name = fc_args["project_name"].as_str().unwrap_or("");
+                    let folder_path = fc_args["folder_path"].as_str().unwrap_or("").trim_start_matches('/');
+                    match sanitize_project_slug(raw_name) {
+                        Err(e) => serde_json::json!({ "error": e }),
+                        Ok(slug) => {
+                            let proj_dir = base_root.join(&slug);
+                            match fs::create_dir_all(&proj_dir).and_then(|_| {
+                                let target = sanitize_relative_path(&proj_dir, folder_path)
+                                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                                fs::create_dir_all(target)
+                            }) {
+                                Err(e) => serde_json::json!({ "error": e.to_string() }),
+                                Ok(()) => {
+                                    let root_str = proj_dir.to_string_lossy().to_string();
+                                    if !created_map.contains_key(&slug) {
+                                        created_order.push(slug.clone());
+                                        created_map.insert(
+                                            slug.clone(),
+                                            CreatedProjectSummary {
+                                                id: root_str.clone(),
+                                                name: slug.clone(),
+                                                description: "Project created via Quick Chat".into(),
+                                                language: "Folder".into(),
+                                                root_path: Some(root_str),
+                                            },
+                                        );
+                                    }
+                                    serde_json::json!({ "ok": true, "project": slug, "folder": folder_path })
+                                }
+                            }
+                        }
+                    }
+                }
+                "create_file" => {
+                    let raw_name = fc_args["project_name"].as_str().unwrap_or("");
+                    let rel = fc_args["file_path"].as_str().unwrap_or("").trim_start_matches('/');
+                    let content = fc_args["content"].as_str().unwrap_or("");
+                    match sanitize_project_slug(raw_name) {
+                        Err(e) => serde_json::json!({ "error": e }),
+                        Ok(slug) => {
+                            let proj_dir = base_root.join(&slug);
+                            if let Err(e) = fs::create_dir_all(&proj_dir) {
+                                serde_json::json!({ "error": e.to_string() })
+                            } else {
+                                match sanitize_relative_path(&proj_dir, rel)
+                                    .and_then(|target| write_new_file_only(&target, content))
+                                {
+                                    Err(e) => serde_json::json!({ "error": e }),
+                                    Ok(()) => {
+                                        let root_str = proj_dir.to_string_lossy().to_string();
+                                        if !created_map.contains_key(&slug) {
+                                            created_order.push(slug.clone());
+                                            created_map.insert(
+                                                slug.clone(),
+                                                CreatedProjectSummary {
+                                                    id: root_str.clone(),
+                                                    name: slug.clone(),
+                                                    description: "Project created via Quick Chat".into(),
+                                                    language: "Folder".into(),
+                                                    root_path: Some(root_str),
+                                                },
+                                            );
+                                        }
+                                        serde_json::json!({ "ok": true, "project": slug, "file": rel })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                other => serde_json::json!({ "error": format!("Unknown tool: {}", other) }),
+            };
+
+            let mut fr = serde_json::json!({
+                "name": fc_name,
+                "response": tool_result
+            });
+            if let Some(id_val) = fc["id"].as_str() {
+                fr["id"] = serde_json::Value::String(id_val.to_string());
+            }
+            resp_parts.push(serde_json::json!({ "functionResponse": fr }));
+        }
+
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": resp_parts
+        }));
     }
 
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let reply = json["candidates"][0]["content"]["parts"]
-        .as_array()
-        .and_then(|parts| parts.iter().rev().find_map(|p| p["text"].as_str()))
-        .ok_or_else(|| "Empty response from Gemini API".to_string())?;
+    let created_projects = created_order
+        .into_iter()
+        .filter_map(|slug| created_map.remove(&slug))
+        .collect();
 
-    Ok(reply.to_string())
+    Ok(QuickChatResponse {
+        reply: if reply_text.is_empty() { "Done.".into() } else { reply_text },
+        created_projects,
+    })
 }
 
 #[tauri::command]
@@ -477,13 +826,102 @@ async fn cancel_gemini_agent(state: tauri::State<'_, AgentCancelState>) -> Resul
     Ok(())
 }
 
+fn collect_workspace_rel_paths(
+    root_path: &Path,
+    open_buffers: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut paths: Vec<String> = Vec::new();
+
+    let walker = WalkBuilder::new(root_path)
+        .hidden(false)
+        .git_ignore(true)
+        .build();
+
+    for entry in walker.flatten() {
+        if paths.len() >= 1000 {
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.is_empty()
+            || rel.starts_with(".git/")
+            || rel == ".git"
+            || rel.starts_with("node_modules/")
+            || rel.starts_with("target/")
+            || rel.starts_with("dist/")
+            || rel == ".aetheris-project.json"
+        {
+            continue;
+        }
+        if seen.insert(rel.clone()) {
+            paths.push(rel);
+        }
+    }
+
+    for k in open_buffers.keys() {
+        if seen.insert(k.clone()) {
+            paths.push(k.clone());
+        }
+    }
+
+    paths.sort();
+    paths
+}
+
+fn read_workspace_raw_text(
+    root_path: &Path,
+    open_buffers: &HashMap<String, String>,
+    rel_path: &str,
+) -> Option<String> {
+    if let Some(buf) = open_buffers.get(rel_path) {
+        return Some(buf.clone());
+    }
+    let target = sanitize_relative_path(root_path, rel_path).ok()?;
+    fs::read_to_string(target).ok()
+}
+
+fn emit_agent_activity(
+    app: &tauri::AppHandle,
+    id: &str,
+    kind: &str,
+    label: &str,
+    file_path: Option<&str>,
+    status: &str,
+) {
+    let mut act = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "label": label,
+        "status": status
+    });
+    if let Some(fp) = file_path {
+        act["filePath"] = serde_json::Value::String(fp.to_string());
+    }
+    let _ = app.emit(
+        "aetheris-agent-event",
+        serde_json::json!({
+            "type": "activity",
+            "activity": act
+        }),
+    );
+}
+
 #[tauri::command]
 async fn run_gemini_agent(
     app: tauri::AppHandle,
     state: tauri::State<'_, AgentCancelState>,
+    root: String,
     prompt: String,
     active_file: Option<String>,
-    files: Vec<AgentFileContext>,
+    open_buffers: Option<HashMap<String, String>>,
     effort: Option<String>,
     agent_mode: Option<String>,
     history: Option<Vec<ChatTurnInput>>,
@@ -491,6 +929,10 @@ async fn run_gemini_agent(
     let api_key = resolve_gemini_api_key()?;
     let client = reqwest::Client::new();
     let started_at = Instant::now();
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Workspace directory does not exist".into());
+    }
 
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     {
@@ -508,58 +950,134 @@ async fn run_gemini_agent(
         Some("low") => "LOW",
         _ => "MEDIUM",
     };
+    let max_turns: usize = match effort.as_deref() {
+        Some("xhigh") => 24,
+        Some("high") => 18,
+        Some("low") => 8,
+        _ => 14,
+    };
 
-    let mut inspected: Vec<String> = Vec::new();
-    if let Some(ref af) = active_file {
-        inspected.push(af.clone());
-    }
-    for f in &files {
-        if inspected.len() >= 4 {
-            break;
-        }
-        if !inspected.contains(&f.path) {
-            inspected.push(f.path.clone());
-        }
-    }
-    for fp in inspected {
-        let _ = app.emit(
-            "aetheris-agent-event",
-            serde_json::json!({
-                "type": "activity",
-                "activity": {
-                    "id": format!("read-{}", fp),
-                    "kind": "read",
-                    "label": format!("Inspecting {}", fp),
-                    "filePath": fp,
-                    "status": "done"
-                }
-            }),
-        );
-    }
+    let buffer_map = open_buffers.unwrap_or_default();
+    let all_paths = collect_workspace_rel_paths(&root_path, &buffer_map);
+    let preview_tree_list = all_paths
+        .iter()
+        .take(120)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let active_preview = active_file
+        .as_deref()
+        .and_then(|af| read_workspace_raw_text(&root_path, &buffer_map, af));
 
-    let _ = app.emit(
-        "aetheris-agent-event",
-        serde_json::json!({
-            "type": "activity",
-            "activity": {
-                "id": "phase-think",
-                "kind": "think",
-                "label": if is_plan_mode { "Analyzing architecture & plan" } else { "Reasoning over workspace edits" },
-                "status": "running"
-            }
-        }),
+    emit_agent_activity(
+        &app,
+        "phase-think",
+        "think",
+        if is_plan_mode {
+            "Analyzing architecture & plan"
+        } else {
+            "Inspecting workspace with tools"
+        },
+        None,
+        "running",
     );
 
-    let mut context_block = String::new();
-    for f in files.iter().take(28) {
-        let slice: String = f.content.chars().take(18000).collect();
-        context_block.push_str(&format!("\n--- FILE: {} ---\n{}\n", f.path, slice));
-    }
+    let list_decl = serde_json::json!({
+        "name": "list_workspace_files",
+        "description": "List all files in the workspace. Use optional directory prefix or substring filter to inspect large repositories.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "directory": { "type": "STRING", "description": "Optional relative directory prefix (e.g. \"src\" or \"src-tauri\")." },
+                "filter": { "type": "STRING", "description": "Optional case-insensitive path substring filter." }
+            }
+        }
+    });
+    let read_decl = serde_json::json!({
+        "name": "read_file",
+        "description": "Read complete or line-ranged contents of any workspace file with line numbers. Read large files in slices (e.g. 1..400, 401..800) so nothing is missed.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": { "type": "STRING", "description": "Relative file path inside workspace." },
+                "start_line": { "type": "INTEGER", "description": "1-based start line (default 1)." },
+                "end_line": { "type": "INTEGER", "description": "1-based inclusive end line (default up to start_line + 449)." }
+            },
+            "required": ["path"]
+        }
+    });
+    let search_decl = serde_json::json!({
+        "name": "search_workspace",
+        "description": "Search across all workspace files for a text string or symbol name. Returns matching file paths, line numbers, and line previews.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": { "type": "STRING", "description": "Text or symbol substring to search for." },
+                "case_sensitive": { "type": "BOOLEAN", "description": "Match exact case if true." }
+            },
+            "required": ["query"]
+        }
+    });
+    let edit_decl = serde_json::json!({
+        "name": "propose_edit",
+        "description": "Propose targeted search-and-replace hunks on an existing file without rewriting unrelated parts of the file. Always read the relevant lines first so old_text matches verbatim.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": { "type": "STRING", "description": "Relative path of existing file to modify." },
+                "rationale": { "type": "STRING", "description": "Concise reason for this edit." },
+                "edits": {
+                    "type": "ARRAY",
+                    "description": "Ordered list of exact search-and-replace hunks.",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "old_text": { "type": "STRING", "description": "Exact existing lines in the file to replace (must match uniquely)." },
+                            "new_text": { "type": "STRING", "description": "Replacement code for old_text." }
+                        },
+                        "required": ["old_text", "new_text"]
+                    }
+                }
+            },
+            "required": ["path", "rationale", "edits"]
+        }
+    });
+    let create_decl = serde_json::json!({
+        "name": "propose_create_file",
+        "description": "Stage creation of a brand new file in the workspace for diff review.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": { "type": "STRING", "description": "Relative path for the new file." },
+                "rationale": { "type": "STRING", "description": "Why this file is being created." },
+                "content": { "type": "STRING", "description": "Complete contents of the new file." }
+            },
+            "required": ["path", "rationale", "content"]
+        }
+    });
+    let delete_decl = serde_json::json!({
+        "name": "propose_delete_file",
+        "description": "Stage deletion of a workspace file for review.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": { "type": "STRING", "description": "Relative path of file to delete." },
+                "rationale": { "type": "STRING", "description": "Why this file should be removed." }
+            },
+            "required": ["path", "rationale"]
+        }
+    });
+
+    let declarations = if is_plan_mode {
+        vec![list_decl, read_decl, search_decl]
+    } else {
+        vec![list_decl, read_decl, search_decl, edit_decl, create_decl, delete_decl]
+    };
 
     let system_prompt = if is_plan_mode {
-        "You are Aetheris in PLAN MODE (read-only). Analyze the workspace files and produce a structured engineering plan as JSON with: summary (technical findings and design overview), steps (detailed ordered implementation steps citing exact file paths and symbols), and patches (MUST be an empty array [] in Plan Mode—do not emit file modifications)."
+        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools: list_workspace_files, read_file (with line ranges), and search_workspace. Always inspect all relevant files before planning. Never guess file contents. Output a clear technical summary followed by numbered concrete steps citing exact file paths and symbols."
     } else {
-        "You are Aetheris in ACTION MODE. Inspect the provided workspace files and return JSON with summary, steps (array of strings), and patches (array of {path, action: create|modify|delete, rationale, content}). Always provide complete updated file content when action is create or modify."
+        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools: list_workspace_files, read_file, search_workspace, propose_edit (targeted search-and-replace hunks), propose_create_file, and propose_delete_file. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. After staging all edits, conclude with a concise summary and ordered verification steps."
     };
 
     let mut contents: Vec<serde_json::Value> = history
@@ -581,167 +1099,547 @@ async fn run_gemini_agent(
         })
         .collect();
 
+    let active_snippet = match active_preview {
+        Some(ref txt) => format!(
+            "\nActive editor file ({}, {} lines) — use read_file for full or other files.",
+            active_file.as_deref().unwrap_or("none"),
+            txt.lines().count()
+        ),
+        None => String::new(),
+    };
+
     let user_msg = format!(
-        "Mode: {}\nActive file: {}\nUser request: {}\nWorkspace files:{}",
-        if is_plan_mode { "PLAN" } else { "ACTION" },
+        "Mode: {}\nActive editor file: {}{}\nTotal workspace files: {}\nFiles overview (call list_workspace_files for full list if needed):\n{}\n\nUser request:\n{}",
+        if is_plan_mode { "PLAN (read-only)" } else { "ACTION (tool-based edits)" },
         active_file.unwrap_or_else(|| "none".into()),
-        prompt,
-        context_block
+        active_snippet,
+        all_paths.len(),
+        preview_tree_list,
+        prompt
     );
     contents.push(serde_json::json!({
         "role": "user",
         "parts": [{ "text": user_msg }]
     }));
 
-    let body = serde_json::json!({
-        "systemInstruction": { "parts": [{ "text": system_prompt }] },
-        "contents": contents,
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "thinkingConfig": {
-                "thinkingLevel": thinking_level,
-                "includeThoughts": true
-            }
-        }
-    });
-
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse&key={}",
         api_key
     );
 
-    let send_fut = client.post(&url).json(&body).send();
-    let mut res = tokio::select! {
-        _ = &mut cancel_rx => {
-            return Err("CANCELLED".into());
-        }
-        r = send_fut => {
-            r.map_err(|e| format!("Network error contacting Gemini API: {}", e))?
-        }
-    };
-
-    if !res.status().is_success() {
-        let txt = res.text().await.unwrap_or_default();
-        return Err(format!("Gemini API error: {}", txt));
-    }
-
-    let path_re = Regex::new(r#""path"\s*:\s*"([^"\\]+)""#).ok();
-    let mut sse_buf = String::new();
-    let mut raw_answer = String::new();
+    let mut staged_patches: HashMap<String, AgentPatch> = HashMap::new();
+    let mut staged_order: Vec<String> = Vec::new();
+    let mut step_trace: Vec<String> = Vec::new();
     let mut thoughts_accum = String::new();
-    let mut emitted_drafting = false;
-    let mut seen_paths: Vec<String> = Vec::new();
+    let mut thought_start_ms: Option<u64> = None;
     let mut thought_end_ms: Option<u64> = None;
+    let mut final_answer_text = String::new();
 
-    loop {
-        let chunk_opt = tokio::select! {
+    for turn in 0..max_turns {
+        let body = serde_json::json!({
+            "systemInstruction": { "parts": [{ "text": system_prompt }] },
+            "contents": contents,
+            "tools": [{ "functionDeclarations": declarations }],
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingLevel": thinking_level,
+                    "includeThoughts": true
+                }
+            }
+        });
+
+        let send_fut = client.post(&url).json(&body).send();
+        let mut res = tokio::select! {
             _ = &mut cancel_rx => {
+                let mut guard = state.tx.lock().await;
+                *guard = None;
                 return Err("CANCELLED".into());
             }
-            c = res.chunk() => {
-                c.map_err(|e| format!("Stream read error: {}", e))?
+            r = send_fut => {
+                r.map_err(|e| format!("Network error contacting Gemini API: {}", e))?
             }
         };
 
-        let Some(chunk) = chunk_opt else {
-            break;
-        };
+        if !res.status().is_success() {
+            let txt = res.text().await.unwrap_or_default();
+            let mut guard = state.tx.lock().await;
+            *guard = None;
+            return Err(format!("Gemini API error: {}", txt));
+        }
 
-        sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+        let mut sse_buf = String::new();
+        let mut model_parts: Vec<serde_json::Value> = Vec::new();
+        let mut function_calls: Vec<serde_json::Value> = Vec::new();
+        let mut turn_text = String::new();
 
-        while let Some(newline_pos) = sse_buf.find('\n') {
-            let line = sse_buf[..newline_pos].trim().to_string();
-            sse_buf.drain(..=newline_pos);
-
-            if !line.starts_with("data:") {
-                continue;
-            }
-            let payload = line.trim_start_matches("data:").trim();
-            if payload.is_empty() || payload == "[DONE]" {
-                continue;
-            }
-
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
-                continue;
+        loop {
+            let chunk_opt = tokio::select! {
+                _ = &mut cancel_rx => {
+                    let mut guard = state.tx.lock().await;
+                    *guard = None;
+                    return Err("CANCELLED".into());
+                }
+                c = res.chunk() => {
+                    c.map_err(|e| format!("Stream read error: {}", e))?
+                }
             };
-            let Some(parts) = json["candidates"][0]["content"]["parts"].as_array() else {
-                continue;
+
+            let Some(chunk) = chunk_opt else {
+                break;
             };
 
-            for part in parts {
-                let text = part["text"].as_str().unwrap_or("");
-                if text.is_empty() {
+            sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(newline_pos) = sse_buf.find('\n') {
+                let line = sse_buf[..newline_pos].trim().to_string();
+                sse_buf.drain(..=newline_pos);
+
+                if !line.starts_with("data:") {
                     continue;
                 }
-                if part["thought"].as_bool() == Some(true) {
-                    thoughts_accum.push_str(text);
-                    let _ = app.emit(
-                        "aetheris-agent-event",
-                        serde_json::json!({
-                            "type": "thought",
-                            "delta": text
-                        }),
-                    );
-                } else {
-                    if !emitted_drafting {
-                        emitted_drafting = true;
-                        thought_end_ms = Some(started_at.elapsed().as_millis() as u64);
-                        let _ = app.emit(
-                            "aetheris-agent-event",
-                            serde_json::json!({
-                                "type": "activity",
-                                "activity": {
-                                    "id": "phase-think",
-                                    "kind": "think",
-                                    "label": if is_plan_mode { "Analyzed architecture & plan" } else { "Finished reasoning" },
-                                    "status": "done"
-                                }
-                            }),
-                        );
-                        let _ = app.emit(
-                            "aetheris-agent-event",
-                            serde_json::json!({
-                                "type": "activity",
-                                "activity": {
-                                    "id": "phase-draft",
-                                    "kind": if is_plan_mode { "plan" } else { "edit" },
-                                    "label": if is_plan_mode { "Writing step-by-step plan" } else { "Drafting workspace patches" },
-                                    "status": "running"
-                                }
-                            }),
-                        );
+                let payload = line.trim_start_matches("data:").trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+                    continue;
+                };
+                let Some(parts) = json["candidates"][0]["content"]["parts"].as_array() else {
+                    continue;
+                };
+
+                for part in parts {
+                    let text = part["text"].as_str().unwrap_or("");
+                    if part["thought"].as_bool() == Some(true) {
+                        if !text.is_empty() {
+                            if thought_start_ms.is_none() {
+                                thought_start_ms = Some(started_at.elapsed().as_millis() as u64);
+                            }
+                            thought_end_ms = Some(started_at.elapsed().as_millis() as u64);
+                            thoughts_accum.push_str(text);
+                            let _ = app.emit(
+                                "aetheris-agent-event",
+                                serde_json::json!({
+                                    "type": "thought",
+                                    "delta": text
+                                }),
+                            );
+                        }
+                        continue;
                     }
 
-                    raw_answer.push_str(text);
-
-                    if !is_plan_mode {
-                        if let Some(ref re) = path_re {
-                            for cap in re.captures_iter(&raw_answer) {
-                                if let Some(m) = cap.get(1) {
-                                    let p = m.as_str().to_string();
-                                    if !seen_paths.contains(&p) {
-                                        seen_paths.push(p.clone());
-                                        let _ = app.emit(
-                                            "aetheris-agent-event",
-                                            serde_json::json!({
-                                                "type": "activity",
-                                                "activity": {
-                                                    "id": format!("edit-{}", p),
-                                                    "kind": "edit",
-                                                    "label": format!("Preparing edit -> {}", p),
-                                                    "filePath": p,
-                                                    "status": "done"
-                                                }
-                                            }),
-                                        );
-                                    }
-                                }
+                    if part.get("functionCall").is_some() {
+                        model_parts.push(part.clone());
+                        function_calls.push(part["functionCall"].clone());
+                    } else if !text.is_empty() || part.get("thoughtSignature").is_some() {
+                        if !text.is_empty() {
+                            turn_text.push_str(text);
+                        }
+                        let can_merge = if let Some(last) = model_parts.last() {
+                            last.get("text").and_then(|v| v.as_str()).is_some()
+                                && last.get("functionCall").is_none()
+                                && last.get("thoughtSignature").is_none()
+                                && part.get("thoughtSignature").is_none()
+                        } else {
+                            false
+                        };
+                        if can_merge {
+                            if let Some(last) = model_parts.last_mut() {
+                                let prev = last["text"].as_str().unwrap_or("");
+                                last["text"] = serde_json::Value::String(format!("{}{}", prev, text));
                             }
+                        } else {
+                            model_parts.push(part.clone());
                         }
                     }
                 }
             }
         }
+
+        if !model_parts.is_empty() {
+            contents.push(serde_json::json!({
+                "role": "model",
+                "parts": model_parts
+            }));
+        }
+
+        if function_calls.is_empty() {
+            final_answer_text = turn_text.trim().to_string();
+            break;
+        }
+
+        let mut response_parts: Vec<serde_json::Value> = Vec::new();
+        for (call_idx, fc) in function_calls.into_iter().enumerate() {
+            let fc_name = fc["name"].as_str().unwrap_or("").to_string();
+            let fc_args = fc["args"].clone();
+            let act_id = format!("tool-{}-{}-{}", started_at.elapsed().as_millis(), turn, call_idx);
+
+            let tool_out: serde_json::Value = match fc_name.as_str() {
+                "list_workspace_files" => {
+                    let dir_prefix = fc_args["directory"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim_matches('/')
+                        .to_string();
+                    let filter_str = fc_args["filter"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .to_lowercase();
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "read",
+                        if dir_prefix.is_empty() {
+                            "Listing workspace files"
+                        } else {
+                            "Listing directory files"
+                        },
+                        None,
+                        "running",
+                    );
+                    let mut filtered = collect_workspace_rel_paths(&root_path, &buffer_map);
+                    if !dir_prefix.is_empty() {
+                        filtered.retain(|p| p == &dir_prefix || p.starts_with(&format!("{}/", dir_prefix)));
+                    }
+                    if !filter_str.is_empty() {
+                        filtered.retain(|p| p.to_lowercase().contains(&filter_str));
+                    }
+                    let count = filtered.len();
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "read",
+                        &format!("Indexed {} file(s)", count),
+                        None,
+                        "done",
+                    );
+                    step_trace.push(if dir_prefix.is_empty() {
+                        format!("Indexed {} workspace file(s)", count)
+                    } else {
+                        format!("Indexed {} workspace file(s) under {}", count, dir_prefix)
+                    });
+                    let slice: Vec<String> = filtered.into_iter().take(500).collect();
+                    serde_json::json!({ "totalCount": count, "files": slice })
+                }
+                "read_file" => {
+                    let rel_path = fc_args["path"].as_str().unwrap_or("").trim_start_matches('/').to_string();
+                    let start_line = fc_args["start_line"].as_u64().unwrap_or(1).max(1) as usize;
+                    let req_end = fc_args["end_line"]
+                        .as_u64()
+                        .map(|v| v as usize)
+                        .unwrap_or(start_line + 449);
+                    let end_line = req_end.max(start_line).min(start_line + 499);
+
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "read",
+                        &format!("Reading {}", rel_path),
+                        Some(&rel_path),
+                        "running",
+                    );
+
+                    let current_text = match staged_patches.get(&rel_path) {
+                        Some(p) if p.action == "delete" => None,
+                        Some(p) => Some(p.content.clone()),
+                        None => read_workspace_raw_text(&root_path, &buffer_map, &rel_path),
+                    };
+
+                    match current_text {
+                        None => {
+                            emit_agent_activity(
+                                &app,
+                                &act_id,
+                                "read",
+                                &format!("File not found: {}", rel_path),
+                                None,
+                                "done",
+                            );
+                            serde_json::json!({ "error": format!("File not found: {}", rel_path) })
+                        }
+                        Some(text) => {
+                            let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+                            let total_lines = lines.len();
+                            let clamped_end = total_lines.min(end_line);
+                            let numbered = if start_line <= clamped_end {
+                                lines[(start_line - 1)..clamped_end]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, l)| format!("{}: {}", start_line + i, l))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            } else {
+                                String::new()
+                            };
+                            emit_agent_activity(
+                                &app,
+                                &act_id,
+                                "read",
+                                &format!("Read {} ({}-{}/{})", rel_path, start_line, clamped_end, total_lines),
+                                Some(&rel_path),
+                                "done",
+                            );
+                            step_trace.push(format!(
+                                "Inspected {} (lines {}–{} of {})",
+                                rel_path, start_line, clamped_end, total_lines
+                            ));
+                            serde_json::json!({
+                                "path": rel_path,
+                                "totalLines": total_lines,
+                                "startLine": start_line,
+                                "endLine": clamped_end,
+                                "truncated": clamped_end < total_lines,
+                                "content": numbered
+                            })
+                        }
+                    }
+                }
+                "search_workspace" => {
+                    let query = fc_args["query"].as_str().unwrap_or("").to_string();
+                    let case_sensitive = fc_args["case_sensitive"].as_bool().unwrap_or(false);
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "read",
+                        &format!("Searching for \"{}\"", query.chars().take(32).collect::<String>()),
+                        None,
+                        "running",
+                    );
+                    let files = collect_workspace_rel_paths(&root_path, &buffer_map);
+                    let needle = if case_sensitive { query.clone() } else { query.to_lowercase() };
+                    let mut matches: Vec<serde_json::Value> = Vec::new();
+                    for rel_path in files {
+                        if matches.len() >= 80 {
+                            break;
+                        }
+                        let Some(raw) = read_workspace_raw_text(&root_path, &buffer_map, &rel_path) else {
+                            continue;
+                        };
+                        for (idx, line) in raw.lines().enumerate() {
+                            if matches.len() >= 80 {
+                                break;
+                            }
+                            let hit = if case_sensitive {
+                                line.contains(&needle)
+                            } else {
+                                line.to_lowercase().contains(&needle)
+                            };
+                            if hit {
+                                matches.push(serde_json::json!({
+                                    "path": rel_path,
+                                    "line": idx + 1,
+                                    "text": line.trim().chars().take(160).collect::<String>()
+                                }));
+                            }
+                        }
+                    }
+                    let count = matches.len();
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "read",
+                        &format!("Search \"{}\" -> {} hit(s)", query.chars().take(24).collect::<String>(), count),
+                        None,
+                        "done",
+                    );
+                    step_trace.push(format!("Searched workspace for \"{}\" ({} matches)", query, count));
+                    serde_json::json!({ "matchCount": count, "matches": matches })
+                }
+                "propose_edit" if !is_plan_mode => {
+                    let rel_path = fc_args["path"].as_str().unwrap_or("").trim_start_matches('/').to_string();
+                    let rationale = fc_args["rationale"].as_str().unwrap_or("Update file").to_string();
+                    let edits = fc_args["edits"].as_array().cloned().unwrap_or_default();
+
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "edit",
+                        &format!("Editing {}", rel_path),
+                        Some(&rel_path),
+                        "running",
+                    );
+
+                    let current = match staged_patches.get(&rel_path) {
+                        Some(p) if p.action == "delete" => None,
+                        Some(p) => Some(p.content.clone()),
+                        None => read_workspace_raw_text(&root_path, &buffer_map, &rel_path),
+                    };
+
+                    match current {
+                        None => serde_json::json!({
+                            "error": format!("Cannot edit \"{}\" because it does not exist. Use propose_create_file instead.", rel_path)
+                        }),
+                        Some(mut next_content) => {
+                            let baseline = staged_patches
+                                .get(&rel_path)
+                                .map(|p| p.original_content.clone())
+                                .unwrap_or_else(|| next_content.clone());
+
+                            let mut edit_err: Option<String> = None;
+                            for (i, edit) in edits.iter().enumerate() {
+                                let old_text = edit["old_text"].as_str().unwrap_or("");
+                                let new_text = edit["new_text"].as_str().unwrap_or("");
+                                if old_text.is_empty() {
+                                    edit_err = Some(format!(
+                                        "Edit #{} has empty old_text. Call read_file to copy exact lines.",
+                                        i + 1
+                                    ));
+                                    break;
+                                }
+
+                                let mut resolved_old = old_text.to_string();
+                                let mut resolved_new = new_text.to_string();
+                                let mut occurrences = next_content.matches(&resolved_old).count();
+
+                                if occurrences == 0 && next_content.contains("\r\n") {
+                                    let crlf_old = old_text.replace("\r\n", "\n").replace('\n', "\r\n");
+                                    let crlf_new = new_text.replace("\r\n", "\n").replace('\n', "\r\n");
+                                    let crlf_occ = next_content.matches(&crlf_old).count();
+                                    if crlf_occ > 0 {
+                                        resolved_old = crlf_old;
+                                        resolved_new = crlf_new;
+                                        occurrences = crlf_occ;
+                                    }
+                                }
+
+                                if occurrences == 0 {
+                                    edit_err = Some(format!(
+                                        "Edit #{} old_text not found in \"{}\". Call read_file on \"{}\" to verify exact whitespace and lines.",
+                                        i + 1, rel_path, rel_path
+                                    ));
+                                    break;
+                                }
+                                if occurrences > 1 {
+                                    edit_err = Some(format!(
+                                        "Edit #{} old_text matched {} places in \"{}\". Include 2-3 surrounding context lines so it is unique.",
+                                        i + 1, occurrences, rel_path
+                                    ));
+                                    break;
+                                }
+
+                                next_content = next_content.replacen(&resolved_old, &resolved_new, 1);
+                            }
+
+                            if let Some(err) = edit_err {
+                                serde_json::json!({ "error": err })
+                            } else {
+                                let action = if staged_patches.get(&rel_path).map(|p| p.action.as_str()) == Some("create") {
+                                    "create".to_string()
+                                } else {
+                                    "modify".to_string()
+                                };
+                                if !staged_patches.contains_key(&rel_path) {
+                                    staged_order.push(rel_path.clone());
+                                }
+                                staged_patches.insert(
+                                    rel_path.clone(),
+                                    AgentPatch {
+                                        path: rel_path.clone(),
+                                        action,
+                                        rationale,
+                                        content: next_content,
+                                        original_content: baseline,
+                                    },
+                                );
+                                emit_agent_activity(
+                                    &app,
+                                    &act_id,
+                                    "edit",
+                                    &format!("Staged edit -> {}", rel_path),
+                                    Some(&rel_path),
+                                    "done",
+                                );
+                                step_trace.push(format!("Proposed {} targeted edit(s) in {}", edits.len(), rel_path));
+                                serde_json::json!({ "ok": true, "path": rel_path, "appliedEdits": edits.len() })
+                            }
+                        }
+                    }
+                }
+                "propose_create_file" if !is_plan_mode => {
+                    let rel_path = fc_args["path"].as_str().unwrap_or("").trim_start_matches('/').to_string();
+                    let rationale = fc_args["rationale"].as_str().unwrap_or("Create new file").to_string();
+                    let content = fc_args["content"].as_str().unwrap_or("").to_string();
+                    let baseline = staged_patches
+                        .get(&rel_path)
+                        .map(|p| p.original_content.clone())
+                        .or_else(|| read_workspace_raw_text(&root_path, &buffer_map, &rel_path))
+                        .unwrap_or_default();
+                    let action = if baseline.is_empty() { "create" } else { "modify" }.to_string();
+                    if !staged_patches.contains_key(&rel_path) {
+                        staged_order.push(rel_path.clone());
+                    }
+                    staged_patches.insert(
+                        rel_path.clone(),
+                        AgentPatch {
+                            path: rel_path.clone(),
+                            action,
+                            rationale,
+                            content,
+                            original_content: baseline,
+                        },
+                    );
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "edit",
+                        &format!("Staged new file -> {}", rel_path),
+                        Some(&rel_path),
+                        "done",
+                    );
+                    step_trace.push(format!("Proposed new file {}", rel_path));
+                    serde_json::json!({ "ok": true, "path": rel_path })
+                }
+                "propose_delete_file" if !is_plan_mode => {
+                    let rel_path = fc_args["path"].as_str().unwrap_or("").trim_start_matches('/').to_string();
+                    let rationale = fc_args["rationale"].as_str().unwrap_or("Remove file").to_string();
+                    let baseline = staged_patches
+                        .get(&rel_path)
+                        .map(|p| p.original_content.clone())
+                        .or_else(|| read_workspace_raw_text(&root_path, &buffer_map, &rel_path))
+                        .unwrap_or_default();
+                    if !staged_patches.contains_key(&rel_path) {
+                        staged_order.push(rel_path.clone());
+                    }
+                    staged_patches.insert(
+                        rel_path.clone(),
+                        AgentPatch {
+                            path: rel_path.clone(),
+                            action: "delete".into(),
+                            rationale,
+                            content: String::new(),
+                            original_content: baseline,
+                        },
+                    );
+                    emit_agent_activity(
+                        &app,
+                        &act_id,
+                        "edit",
+                        &format!("Staged deletion -> {}", rel_path),
+                        Some(&rel_path),
+                        "done",
+                    );
+                    step_trace.push(format!("Proposed removal of {}", rel_path));
+                    serde_json::json!({ "ok": true, "path": rel_path })
+                }
+                other => serde_json::json!({ "error": format!("Unknown or disallowed tool: {}", other) }),
+            };
+
+            let mut fr = serde_json::json!({
+                "name": fc_name,
+                "response": tool_out
+            });
+            if let Some(id_val) = fc["id"].as_str() {
+                fr["id"] = serde_json::Value::String(id_val.to_string());
+            }
+            response_parts.push(serde_json::json!({ "functionResponse": fr }));
+        }
+
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": response_parts
+        }));
     }
 
     {
@@ -749,41 +1647,94 @@ async fn run_gemini_agent(
         *guard = None;
     }
 
-    #[derive(Deserialize)]
-    struct RawParsed {
-        summary: Option<String>,
-        steps: Option<Vec<String>>,
-        patches: Option<Vec<AgentPatch>>,
-    }
-
-    let parsed = serde_json::from_str::<RawParsed>(raw_answer.trim())
-        .map_err(|e| format!("Failed to parse structured agent plan: {}", e))?;
-
-    let patches = if is_plan_mode {
+    let patches: Vec<AgentPatch> = if is_plan_mode {
         Vec::new()
     } else {
-        parsed.patches.unwrap_or_default()
+        staged_order
+            .into_iter()
+            .filter_map(|p| staged_patches.remove(&p))
+            .collect()
     };
 
-    let _ = app.emit(
-        "aetheris-agent-event",
-        serde_json::json!({
-            "type": "activity",
-            "activity": {
-                "id": "phase-draft",
-                "kind": "done",
-                "label": if is_plan_mode { "Plan ready".to_string() } else { format!("Prepared {} file change(s)", patches.len()) },
-                "status": "done"
+    let thinking_duration_ms = match thought_start_ms {
+        Some(start_ms) => {
+            let end_ms = thought_end_ms.unwrap_or_else(|| started_at.elapsed().as_millis() as u64);
+            end_ms.saturating_sub(start_ms).max(200)
+        }
+        None => started_at.elapsed().as_millis() as u64,
+    };
+
+    let parsed_steps: Vec<String> = final_answer_text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            let mut chars = l.chars();
+            let mut has_digit = false;
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    has_digit = true;
+                } else {
+                    return has_digit && c == '.' && chars.next() == Some(' ');
+                }
             }
-        }),
+            false
+        })
+        .filter_map(|l| l.split_once(". ").map(|(_, rest)| rest.trim().to_string()))
+        .take(12)
+        .collect();
+
+    let mut final_steps = parsed_steps;
+    if final_steps.is_empty() {
+        let mut seen_steps: HashSet<String> = HashSet::new();
+        for s in step_trace {
+            if seen_steps.insert(s.clone()) {
+                final_steps.push(s);
+                if final_steps.len() >= 12 {
+                    break;
+                }
+            }
+        }
+    }
+
+    emit_agent_activity(
+        &app,
+        "phase-think",
+        "think",
+        if is_plan_mode {
+            "Analyzed architecture & plan"
+        } else {
+            "Completed workspace execution"
+        },
+        None,
+        "done",
+    );
+    emit_agent_activity(
+        &app,
+        "phase-draft",
+        "done",
+        &if is_plan_mode {
+            "Plan ready".to_string()
+        } else {
+            format!("Prepared {} file change(s)", patches.len())
+        },
+        None,
+        "done",
     );
 
+    let summary = if !final_answer_text.is_empty() {
+        final_answer_text
+    } else if !patches.is_empty() {
+        format!("Prepared {} file change(s) for review.", patches.len())
+    } else {
+        "Completed workspace analysis.".into()
+    };
+
     Ok(AgentPlanResponse {
-        summary: parsed.summary.unwrap_or_else(|| "Completed workspace analysis.".into()),
-        steps: parsed.steps.unwrap_or_default(),
+        summary,
+        steps: final_steps,
         patches,
         thoughts: thoughts_accum.trim().to_string(),
-        thinking_duration_ms: thought_end_ms.unwrap_or_else(|| started_at.elapsed().as_millis() as u64),
+        thinking_duration_ms,
     })
 }
 

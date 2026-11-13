@@ -11,6 +11,7 @@ import {
   AgentMessage,
   AgentMode,
   AgentPatch,
+  CreatedProjectSummary,
   CursorPosition,
   EditorTab,
   FileNode,
@@ -63,9 +64,7 @@ import {
 import {
   clearWorkspaceSessionMessages,
   getWorkspaceSessionKey,
-  loadHomeChatHistory,
   loadWorkspaceSession,
-  saveHomeChatHistory,
   saveWorkspaceSession,
 } from './services/chatStorage';
 import { TopBar } from './components/TopBar';
@@ -166,9 +165,8 @@ export default function App() {
     followAiRef.current = followAi;
   }, [followAi]);
 
-  // Home smalltalk chat state
+  // Home Quick Chat state (fresh session each time Home is opened)
   const [homeChatMessages, setHomeChatMessages] = useState<HomeChatMessage[]>([]);
-  const [homeChatHydrated, setHomeChatHydrated] = useState(false);
   const [isHomeChatBusy, setIsHomeChatBusy] = useState(false);
 
   // Terminal state
@@ -297,15 +295,10 @@ export default function App() {
     [showNotice, refreshGitStatus]
   );
 
-  // Boot: load available workspaces + saved home chat history
+  // Boot: load available workspaces (Home Quick Chat always starts fresh)
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const savedHome = await loadHomeChatHistory();
-      if (mounted) {
-        setHomeChatMessages(savedHome);
-        setHomeChatHydrated(true);
-      }
       if (isTauriRuntime()) return;
       const list = await listStarterWorkspaces();
       if (mounted) {
@@ -316,12 +309,6 @@ export default function App() {
       mounted = false;
     };
   }, []);
-
-  // Persist Home Quick Chat automatically
-  useEffect(() => {
-    if (!homeChatHydrated) return;
-    void saveHomeChatHistory(homeChatMessages);
-  }, [homeChatMessages, homeChatHydrated]);
 
   // Persist per-workspace conversation & agent settings automatically
   useEffect(() => {
@@ -655,17 +642,47 @@ export default function App() {
     setIsHomeChatBusy(true);
 
     try {
-      const reply = await sendHomeChat(
+      const { reply, createdProjects } = await sendHomeChat(
         nextHistory
           .filter((m) => !m.error)
           .map((m) => ({ role: m.role, content: m.content }))
       );
+
+      if (createdProjects.length > 0) {
+        if (!isTauriRuntime()) {
+          const updatedList = await listStarterWorkspaces();
+          setStarters(updatedList);
+        }
+        const nowLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        let updatedRecents = recentWorkspaces;
+        for (const proj of createdProjects) {
+          updatedRecents = recordRecentWorkspace(
+            proj.rootPath
+              ? {
+                  id: proj.rootPath,
+                  name: proj.name,
+                  source: 'tauri-native',
+                  nativeRoot: proj.rootPath,
+                  lastOpenedAt: nowLabel,
+                }
+              : {
+                  id: proj.id,
+                  name: proj.name,
+                  source: 'starter',
+                  lastOpenedAt: nowLabel,
+                }
+          );
+        }
+        setRecentWorkspaces(updatedRecents);
+      }
+
       setHomeChatMessages((prev) => [
         ...prev,
         {
           id: `hc-a-${Date.now()}`,
           role: 'assistant',
           content: reply,
+          createdProjects: createdProjects.length > 0 ? createdProjects : undefined,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ]);
@@ -683,6 +700,26 @@ export default function App() {
     } finally {
       setIsHomeChatBusy(false);
     }
+  };
+
+  const handleOpenCreatedProject = async (proj: CreatedProjectSummary) => {
+    if (proj.rootPath) {
+      const nextCtx: ActiveWorkspaceContext = {
+        source: 'tauri-native',
+        id: proj.rootPath,
+        name: proj.name,
+        nativeRoot: proj.rootPath,
+      };
+      await activateWorkspace(nextCtx, {
+        id: proj.rootPath,
+        name: proj.name,
+        source: 'tauri-native',
+        nativeRoot: proj.rootPath,
+        lastOpenedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      });
+      return;
+    }
+    await handleSelectStarter(proj.id);
   };
 
   const handleResetStarter = async () => {
@@ -1253,7 +1290,10 @@ export default function App() {
           onOpenLocalFolder={handleOpenLocalFolder}
           onSelectStarter={handleSelectStarter}
           onResetStarter={handleResetStarter}
-          onGoHome={() => setView('home')}
+          onGoHome={() => {
+            setHomeChatMessages([]);
+            setView('home');
+          }}
         />
       )}
 
@@ -1291,6 +1331,7 @@ export default function App() {
               setRecentWorkspaces(removeRecentWorkspace(item.id, item.source))
             }
             onOpenWorkspaceSummary={(ws) => void handleSelectStarter(ws.id)}
+            onOpenCreatedProject={(proj) => void handleOpenCreatedProject(proj)}
             onSendChat={handleSendHomeChat}
             onClearChat={() => setHomeChatMessages([])}
           />
@@ -1349,7 +1390,7 @@ export default function App() {
         <div className="flex flex-1 flex-col min-w-0 min-h-0 overflow-hidden">
           {/* Tab bar */}
           <div className="flex h-9 shrink-0 items-center justify-between border-b border-[#272B38] bg-[#161922] px-1 select-none">
-            <div className="flex flex-1 items-center overflow-x-auto">
+            <div className="tab-strip flex h-full min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden">
               {tabs.map((tab) => {
                 const isActive = !activeDiffPatch && !activeGitDiff && tab.path === activeTabPath;
                 return (
@@ -1360,7 +1401,7 @@ export default function App() {
                       setActiveGitDiff(null);
                       setActiveTabPath(tab.path);
                     }}
-                    className={`group flex h-9 cursor-pointer items-center gap-2 border-r border-[#272B38] px-3 text-[12px] transition-colors whitespace-nowrap shrink-0 ${
+                    className={`group flex h-full cursor-pointer items-center gap-2 border-r border-[#272B38] px-3 text-[12px] transition-colors whitespace-nowrap shrink-0 ${
                       isActive
                         ? 'bg-[#0F1117] text-[#E6E8EE]'
                         : 'text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE]'
@@ -1384,7 +1425,7 @@ export default function App() {
               })}
 
               {activeDiffPatch && (
-                <div className="flex h-9 items-center gap-2 border-r border-[#272B38] bg-[#0F1117] px-3 text-[12px] text-[#818CF8] whitespace-nowrap shrink-0">
+                <div className="flex h-full items-center gap-2 border-r border-[#272B38] bg-[#0F1117] px-3 text-[12px] text-[#818CF8] whitespace-nowrap shrink-0">
                   <span className="font-mono">Diff: {activeDiffPatch.path}</span>
                   <button
                     type="button"
@@ -1398,7 +1439,7 @@ export default function App() {
               )}
 
               {activeGitDiff && !activeDiffPatch && (
-                <div className="flex h-9 items-center gap-2 border-r border-[#272B38] bg-[#0F1117] px-3 text-[12px] text-[#818CF8] whitespace-nowrap shrink-0">
+                <div className="flex h-full items-center gap-2 border-r border-[#272B38] bg-[#0F1117] px-3 text-[12px] text-[#818CF8] whitespace-nowrap shrink-0">
                   <span className="font-mono">Git Diff: {activeGitDiff.path}</span>
                   <button
                     type="button"
