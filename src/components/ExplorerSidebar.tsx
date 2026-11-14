@@ -11,6 +11,7 @@ import {
   Pencil,
   Search,
   Trash2,
+  X,
 } from 'lucide-react';
 import {
   ExplorerGitBadge,
@@ -197,8 +198,22 @@ export const ExplorerSidebar: React.FC<ExplorerSidebarProps> = ({
   const [renameValue, setRenameValue] = useState('');
   const [githubSplitPct, setGithubSplitPct] = useState<number>(() => loadGithubSplit());
   const [isSplittingGithub, setIsSplittingGithub] = useState(false);
+  const [draftQuery, setDraftQuery] = useState(searchQuery);
 
   const githubBodyRef = useRef<HTMLDivElement | null>(null);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setDraftQuery(searchQuery);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    return () => {
+      if (searchDebounceRef.current) {
+        clearTimeout(searchDebounceRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setExpandedDirs((prev) => {
@@ -683,11 +698,46 @@ export const ExplorerSidebar: React.FC<ExplorerSidebarProps> = ({
               <Search className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-[#8B92A5]" />
               <input
                 type="text"
-                value={searchQuery}
-                onChange={(e) => onSearchChange(e.target.value, symbolsOnly)}
+                value={draftQuery}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setDraftQuery(next);
+                  if (searchDebounceRef.current) {
+                    clearTimeout(searchDebounceRef.current);
+                  }
+                  const delay = next.trim() === '' ? 60 : 220;
+                  searchDebounceRef.current = setTimeout(() => {
+                    onSearchChange(next, symbolsOnly);
+                  }, delay);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (searchDebounceRef.current) {
+                      clearTimeout(searchDebounceRef.current);
+                    }
+                    onSearchChange(draftQuery, symbolsOnly);
+                  }
+                }}
                 placeholder="Search symbols or text..."
-                className="w-full rounded-md border border-[#272B38] bg-[#0F1117] py-1.5 pl-8 pr-2.5 text-[12px] text-[#E6E8EE] placeholder-[#52596E] focus:border-[#6366F1] focus:outline-none"
+                className="w-full rounded-md border border-[#272B38] bg-[#0F1117] py-1.5 pl-8 pr-7 text-[12px] text-[#E6E8EE] placeholder-[#52596E] focus:border-[#6366F1] focus:outline-none"
               />
+              {draftQuery && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  onClick={() => {
+                    if (searchDebounceRef.current) {
+                      clearTimeout(searchDebounceRef.current);
+                    }
+                    setDraftQuery('');
+                    onSearchChange('', symbolsOnly);
+                  }}
+                  className="absolute right-2 top-1.5 rounded p-0.5 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE]"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              )}
             </div>
 
             <div className="flex items-center justify-between text-[11.5px]">
@@ -695,7 +745,12 @@ export const ExplorerSidebar: React.FC<ExplorerSidebarProps> = ({
                 <input
                   type="checkbox"
                   checked={symbolsOnly}
-                  onChange={(e) => onSearchChange(searchQuery, e.target.checked)}
+                  onChange={(e) => {
+                    if (searchDebounceRef.current) {
+                      clearTimeout(searchDebounceRef.current);
+                    }
+                    onSearchChange(draftQuery, e.target.checked);
+                  }}
                   className="accent-[#6366F1]"
                 />
                 <span>Symbols only</span>

@@ -305,55 +305,116 @@ async function buildFileTree(dir: string, root: string): Promise<TreeNode[]> {
 const SYMBOL_REGEX =
   /^\s*(?:pub\s+)?(?:async\s+)?(?:export\s+)?(?:default\s+)?(fn|struct|enum|trait|impl|function|class|interface|type|const|def)\s+([A-Za-z_][A-Za-z0-9_]*)/;
 
+const SEARCH_SKIP_DIRS = new Set([
+  'node_modules',
+  'target',
+  '.git',
+  'dist',
+  'build',
+  '.next',
+  '.turbo',
+  '.cache',
+  'coverage',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '.aetheris-project.json',
+]);
+
+const SEARCH_SKIP_FILES = new Set([
+  'cargo.lock',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+]);
+
+const SEARCH_BINARY_EXT_RE =
+  /\.(png|jpe?g|gif|webp|ico|bmp|svg|wasm|exe|dll|so|dylib|a|o|lib|zip|tar|gz|bz2|xz|7z|pdf|woff2?|ttf|otf|eot|mp3|mp4|webm|mov|avi|ogg|flac|sqlite|db|min\.js|min\.css|map)$/i;
+
 async function searchDirectory(
   dir: string,
   root: string,
   query: string,
   symbolsOnly: boolean,
-  hits: Array<{ filePath: string; line: number; preview: string; symbolKind: string | null; symbolName: string | null }>
+  hits: Array<{ filePath: string; line: number; preview: string; symbolKind: string | null; symbolName: string | null }>,
+  shouldAbort?: () => boolean
 ): Promise<void> {
-  if (hits.length >= 150) return;
+  if (hits.length >= 150 || shouldAbort?.()) return;
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const qLower = query.trim().toLowerCase();
+  const maxBytes = qLower ? 1_000_000 : 512_000;
 
   for (const entry of entries) {
-    if (hits.length >= 150) return;
-    if (
-      entry.name === 'node_modules' ||
-      entry.name === 'target' ||
-      entry.name === '.git' ||
-      entry.name === 'dist' ||
-      entry.name === '.aetheris-project.json'
-    ) {
+    if (hits.length >= 150 || shouldAbort?.()) return;
+    if (SEARCH_SKIP_DIRS.has(entry.name)) {
       continue;
     }
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      await searchDirectory(full, root, query, symbolsOnly, hits);
+      await searchDirectory(full, root, query, symbolsOnly, hits, shouldAbort);
+      continue;
+    }
+    if (
+      SEARCH_SKIP_FILES.has(entry.name.toLowerCase()) ||
+      SEARCH_BINARY_EXT_RE.test(entry.name)
+    ) {
       continue;
     }
 
     let content = '';
     try {
-      content = await fs.readFile(full, 'utf-8');
+      const stat = await fs.stat(full);
+      if (stat.size > maxBytes) continue;
+      const buf = await fs.readFile(full);
+      if (buf.subarray(0, 512).includes(0)) continue;
+      content = buf.toString('utf-8');
     } catch {
       continue;
     }
 
-    const rel = path.relative(root, full).split(path.sep).join('/');
-    const lines = content.split(/\r?\n/);
+    if (qLower) {
+      const contentLower = content.toLowerCase();
+      if (!contentLower.includes(qLower)) continue;
 
-    for (let i = 0; i < lines.length; i++) {
-      if (hits.length >= 150) return;
-      const lineText = lines[i];
-      const match = SYMBOL_REGEX.exec(lineText);
-      if (match) {
-        const [, kind, name] = match;
-        const matchesQuery =
-          !qLower ||
-          name.toLowerCase().includes(qLower) ||
-          lineText.toLowerCase().includes(qLower);
-        if (matchesQuery) {
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      const lines = content.split(/\r?\n/);
+      const lowerLines = contentLower.split(/\r?\n/);
+
+      for (let i = 0; i < lines.length; i++) {
+        if (hits.length >= 150) return;
+        const lineLower = lowerLines[i] ?? lines[i].toLowerCase();
+        if (!lineLower.includes(qLower)) continue;
+
+        const lineText = lines[i];
+        const match = SYMBOL_REGEX.exec(lineText);
+        if (match) {
+          const [, kind, name] = match;
+          hits.push({
+            filePath: rel,
+            line: i + 1,
+            preview: lineText.trim().slice(0, 140),
+            symbolKind: kind,
+            symbolName: name,
+          });
+        } else if (!symbolsOnly) {
+          hits.push({
+            filePath: rel,
+            line: i + 1,
+            preview: lineText.trim().slice(0, 140),
+            symbolKind: null,
+            symbolName: null,
+          });
+        }
+      }
+    } else {
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      const lines = content.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        if (hits.length >= 150) return;
+        const lineText = lines[i];
+        const match = SYMBOL_REGEX.exec(lineText);
+        if (match) {
+          const [, kind, name] = match;
           hits.push({
             filePath: rel,
             line: i + 1,
@@ -362,14 +423,6 @@ async function searchDirectory(
             symbolName: name,
           });
         }
-      } else if (!symbolsOnly && qLower && lineText.toLowerCase().includes(qLower)) {
-        hits.push({
-          filePath: rel,
-          line: i + 1,
-          preview: lineText.trim().slice(0, 140),
-          symbolKind: null,
-          symbolName: null,
-        });
       }
     }
   }
@@ -847,6 +900,12 @@ async function startServer() {
   });
 
   app.get('/api/workspaces/:id/search', async (req, res) => {
+    let closed = false;
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        closed = true;
+      }
+    });
     try {
       const query = String(req.query.q ?? '');
       const symbolsOnly = req.query.symbolsOnly === 'true';
@@ -858,9 +917,11 @@ async function startServer() {
         symbolKind: string | null;
         symbolName: string | null;
       }> = [];
-      await searchDirectory(root, root, query, symbolsOnly, hits);
+      await searchDirectory(root, root, query, symbolsOnly, hits, () => closed);
+      if (closed || res.writableEnded) return;
       res.json({ hits });
     } catch (err) {
+      if (closed || res.writableEnded) return;
       res.status(400).json({ error: err instanceof Error ? err.message : 'Search failed' });
     }
   });

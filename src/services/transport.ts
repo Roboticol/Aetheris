@@ -331,36 +331,123 @@ export function flattenFilePaths(nodes: FileNode[]): string[] {
   return paths;
 }
 
+interface CachedSearchFile {
+  lastModified: number;
+  size: number;
+  text: string;
+  lower: string;
+}
+
+const localSearchCache = new Map<string, CachedSearchFile>();
+const SEARCH_LOCKFILE_RE = /(?:^|\/)(?:cargo\.lock|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
+const SEARCH_SKIP_FILE_RE =
+  /\.(png|jpe?g|gif|webp|ico|bmp|svg|wasm|exe|dll|so|dylib|a|o|lib|zip|tar|gz|bz2|xz|7z|pdf|woff2?|ttf|otf|eot|mp3|mp4|webm|mov|avi|ogg|flac|sqlite|db|min\.js|min\.css|map)$/i;
+
 export async function searchWorkspace(
   ctx: ActiveWorkspaceContext,
   query: string,
   symbolsOnly: boolean,
-  tree: FileNode[]
+  tree: FileNode[],
+  signal?: AbortSignal
 ): Promise<SearchHit[]> {
+  if (signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
-    return tauriInvoke<SearchHit[]>('search_workspace', {
+    const res = await tauriInvoke<SearchHit[]>('search_workspace', {
       root: ctx.nativeRoot,
       query,
       symbolsOnly,
     });
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    return res;
   }
+
   if (ctx.source === 'local-fs' && ctx.localDirHandle) {
-    const allPaths = flattenFilePaths(tree).slice(0, 120);
+    const allPaths = flattenFilePaths(tree)
+      .filter((p) => !SEARCH_LOCKFILE_RE.test(p) && !SEARCH_SKIP_FILE_RE.test(p))
+      .slice(0, 2000);
     const qLower = query.trim().toLowerCase();
+    const maxBytes = qLower ? 1_000_000 : 512_000;
     const hits: SearchHit[] = [];
 
-    for (const filePath of allPaths) {
+    for (let idx = 0; idx < allPaths.length; idx++) {
       if (hits.length >= 150) break;
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      if (idx > 0 && idx % 40 === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      const filePath = allPaths[idx];
       try {
-        const text = await readWorkspaceFile(ctx, filePath);
+        const cacheKey = `${ctx.id}:${filePath}`;
+        let cached = localSearchCache.get(cacheKey);
+        const handle = await resolveLocalFileHandle(ctx.localDirHandle, filePath, false);
+        const file = await handle.getFile();
+        if (file.size > maxBytes) continue;
+
+        if (!cached || cached.lastModified !== file.lastModified || cached.size !== file.size) {
+          const text = await file.text();
+          if (text.slice(0, 512).includes('\0')) continue;
+          cached = {
+            lastModified: file.lastModified,
+            size: file.size,
+            text,
+            lower: text.toLowerCase(),
+          };
+          if (localSearchCache.size > 1500) {
+            const firstKey = localSearchCache.keys().next().value;
+            if (firstKey) localSearchCache.delete(firstKey);
+          }
+          localSearchCache.set(cacheKey, cached);
+        }
+
+        const { text, lower } = cached;
+        if (qLower && !lower.includes(qLower)) {
+          continue;
+        }
+
         const lines = text.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          if (hits.length >= 150) break;
-          const lineText = lines[i];
-          const match = SYMBOL_REGEX.exec(lineText);
-          if (match) {
-            const [, kind, name] = match;
-            if (!qLower || name.toLowerCase().includes(qLower) || lineText.toLowerCase().includes(qLower)) {
+        if (qLower) {
+          const lowerLines = lower.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i++) {
+            if (hits.length >= 150) break;
+            const lineLower = lowerLines[i] ?? lines[i].toLowerCase();
+            if (!lineLower.includes(qLower)) continue;
+
+            const lineText = lines[i];
+            const match = SYMBOL_REGEX.exec(lineText);
+            if (match) {
+              const [, kind, name] = match;
+              hits.push({
+                filePath,
+                line: i + 1,
+                preview: lineText.trim().slice(0, 140),
+                symbolKind: kind,
+                symbolName: name,
+              });
+            } else if (!symbolsOnly) {
+              hits.push({
+                filePath,
+                line: i + 1,
+                preview: lineText.trim().slice(0, 140),
+                symbolKind: null,
+                symbolName: null,
+              });
+            }
+          }
+        } else {
+          for (let i = 0; i < lines.length; i++) {
+            if (hits.length >= 150) break;
+            const lineText = lines[i];
+            const match = SYMBOL_REGEX.exec(lineText);
+            if (match) {
+              const [, kind, name] = match;
               hits.push({
                 filePath,
                 line: i + 1,
@@ -369,14 +456,6 @@ export async function searchWorkspace(
                 symbolName: name,
               });
             }
-          } else if (!symbolsOnly && qLower && lineText.toLowerCase().includes(qLower)) {
-            hits.push({
-              filePath,
-              line: i + 1,
-              preview: lineText.trim().slice(0, 140),
-              symbolKind: null,
-              symbolName: null,
-            });
           }
         }
       } catch {
@@ -387,7 +466,8 @@ export async function searchWorkspace(
   }
 
   const res = await fetch(
-    `/api/workspaces/${encodeURIComponent(ctx.id)}/search?q=${encodeURIComponent(query)}&symbolsOnly=${String(symbolsOnly)}`
+    `/api/workspaces/${encodeURIComponent(ctx.id)}/search?q=${encodeURIComponent(query)}&symbolsOnly=${String(symbolsOnly)}`,
+    { signal }
   );
   const data = (await res.json()) as { hits?: SearchHit[]; error?: string };
   if (!res.ok) throw new Error(data.error ?? 'Search failed');

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useDeferredValue, useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { FileCode2, Search, X } from 'lucide-react';
 import { SearchHit } from '../types/ide';
@@ -28,6 +28,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onSelectFile,
 }) => {
   const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
   const [selectedIndex, setSelectedIndex] = useState(0);
 
   useEffect(() => {
@@ -38,7 +39,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   }, [open]);
 
   const items = useMemo<PaletteItem[]>(() => {
-    const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
 
     const fileItems: PaletteItem[] = filePaths
       .filter((p) => !q || p.toLowerCase().includes(q))

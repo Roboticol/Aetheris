@@ -6,10 +6,14 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, Mutex};
+
+static SEARCH_GEN: AtomicU64 = AtomicU64::new(0);
+static SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Default)]
 struct AgentCancelState {
@@ -304,71 +308,178 @@ fn delete_workspace_entry(root: String, rel_path: String) -> Result<(), String> 
     }
 }
 
-#[tauri::command]
-fn search_workspace(root: String, query: String, symbols_only: bool) -> Result<Vec<SearchHit>, String> {
-    let root_path = PathBuf::from(&root);
-    let q_lower = query.trim().to_lowercase();
-    let sym_re = Regex::new(
-        r"^\s*(?:pub\s+)?(?:async\s+)?(?:export\s+)?(?:default\s+)?(fn|struct|enum|trait|impl|function|class|interface|type|const|def)\s+([A-Za-z_][A-Za-z0-9_]*)",
-    )
-    .map_err(|e| e.to_string())?;
-
-    let mut hits = Vec::new();
-    let walker = WalkBuilder::new(&root_path)
-        .hidden(true)
-        .git_ignore(true)
-        .build();
-
-    for result in walker.flatten() {
-        let path = result.path();
-        if !path.is_file() {
-            continue;
+fn should_skip_search_path(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+        ) || lower.ends_with(".min.js")
+            || lower.ends_with(".min.css")
+            || lower.ends_with(".map")
+        {
+            return true;
         }
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        let rel = path
-            .strip_prefix(&root_path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        for (idx, line) in content.lines().enumerate() {
-            if hits.len() >= 150 {
-                return Ok(hits);
-            }
-            if let Some(caps) = sym_re.captures(line) {
-                let kind = caps.get(1).map(|m| m.as_str().to_string());
-                let name = caps.get(2).map(|m| m.as_str().to_string());
-                let matches_query = q_lower.is_empty()
-                    || name
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q_lower)
-                    || line.to_lowercase().contains(&q_lower);
-                if matches_query {
-                    hits.push(SearchHit {
-                        file_path: rel.clone(),
-                        line: idx + 1,
-                        preview: line.trim().chars().take(140).collect(),
-                        symbol_kind: kind,
-                        symbol_name: name,
-                    });
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        if matches!(
+            ext_lower.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "svg"
+                | "wasm" | "exe" | "dll" | "so" | "dylib" | "a" | "o" | "lib"
+                | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "pdf"
+                | "woff" | "woff2" | "ttf" | "otf" | "eot"
+                | "mp3" | "mp4" | "webm" | "mov" | "avi" | "ogg" | "flac"
+                | "sqlite" | "db" | "bin" | "lock"
+        ) {
+            return true;
+        }
+    }
+    for comp in path.components() {
+        if let Component::Normal(os_str) = comp {
+            if let Some(s) = os_str.to_str() {
+                if matches!(
+                    s,
+                    "node_modules" | "target" | "dist" | "build" | ".git" | ".next"
+                        | ".turbo" | ".cache" | "coverage" | ".venv" | "venv" | "__pycache__"
+                ) {
+                    return true;
                 }
-            } else if !symbols_only && !q_lower.is_empty() && line.to_lowercase().contains(&q_lower) {
-                hits.push(SearchHit {
-                    file_path: rel.clone(),
-                    line: idx + 1,
-                    preview: line.trim().chars().take(140).collect(),
-                    symbol_kind: None,
-                    symbol_name: None,
-                });
             }
         }
     }
+    false
+}
 
-    Ok(hits)
+#[tauri::command]
+async fn search_workspace(
+    root: String,
+    query: String,
+    symbols_only: bool,
+) -> Result<Vec<SearchHit>, String> {
+    let my_gen = SEARCH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let sym_re = SYMBOL_RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:pub\s+)?(?:async\s+)?(?:export\s+)?(?:default\s+)?(fn|struct|enum|trait|impl|function|class|interface|type|const|def)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("valid symbol regex")
+    });
+
+    tokio::task::spawn_blocking(move || {
+        let root_path = PathBuf::from(&root);
+        let q_lower = query.trim().to_lowercase();
+        let mut hits = Vec::new();
+        let max_bytes: u64 = if q_lower.is_empty() { 512 * 1024 } else { 1024 * 1024 };
+
+        let walker = WalkBuilder::new(&root_path)
+            .hidden(true)
+            .git_ignore(true)
+            .build();
+
+        for result in walker.flatten() {
+            if SEARCH_GEN.load(Ordering::Relaxed) != my_gen {
+                return Ok(Vec::new());
+            }
+            if hits.len() >= 150 {
+                break;
+            }
+            let path = result.path();
+            if !path.is_file() || should_skip_search_path(path) {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(path) {
+                if meta.len() > max_bytes {
+                    continue;
+                }
+            }
+            let Ok(bytes) = fs::read(path) else {
+                continue;
+            };
+            let probe_len = bytes.len().min(512);
+            if bytes[..probe_len].contains(&0) {
+                continue;
+            }
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue;
+            };
+
+            let content_lower = if q_lower.is_empty() {
+                String::new()
+            } else {
+                let lower = content.to_lowercase();
+                if !lower.contains(&q_lower) {
+                    continue;
+                }
+                lower
+            };
+
+            let rel = path
+                .strip_prefix(&root_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if q_lower.is_empty() {
+                for (idx, line) in content.lines().enumerate() {
+                    if hits.len() >= 150 {
+                        return Ok(hits);
+                    }
+                    if let Some(caps) = sym_re.captures(line) {
+                        let kind = caps.get(1).map(|m| m.as_str().to_string());
+                        let name = caps.get(2).map(|m| m.as_str().to_string());
+                        hits.push(SearchHit {
+                            file_path: rel.clone(),
+                            line: idx + 1,
+                            preview: line.trim().chars().take(140).collect(),
+                            symbol_kind: kind,
+                            symbol_name: name,
+                        });
+                    }
+                }
+            } else {
+                let mut lower_lines = content_lower.lines();
+                for (idx, line) in content.lines().enumerate() {
+                    if hits.len() >= 150 {
+                        return Ok(hits);
+                    }
+                    let line_lower_owned;
+                    let line_lower = match lower_lines.next() {
+                        Some(l) => l,
+                        None => {
+                            line_lower_owned = line.to_lowercase();
+                            &line_lower_owned
+                        }
+                    };
+                    if !line_lower.contains(&q_lower) {
+                        continue;
+                    }
+                    if let Some(caps) = sym_re.captures(line) {
+                        let kind = caps.get(1).map(|m| m.as_str().to_string());
+                        let name = caps.get(2).map(|m| m.as_str().to_string());
+                        hits.push(SearchHit {
+                            file_path: rel.clone(),
+                            line: idx + 1,
+                            preview: line.trim().chars().take(140).collect(),
+                            symbol_kind: kind,
+                            symbol_name: name,
+                        });
+                    } else if !symbols_only {
+                        hits.push(SearchHit {
+                            file_path: rel.clone(),
+                            line: idx + 1,
+                            preview: line.trim().chars().take(140).collect(),
+                            symbol_kind: None,
+                            symbol_name: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(hits)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

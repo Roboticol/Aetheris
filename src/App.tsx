@@ -175,6 +175,8 @@ export default function App() {
   const [activeGitDiff, setActiveGitDiff] = useState<GitDiffPreview | null>(null);
 
   const agentAbortRef = useRef<AbortController | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchSeqRef = useRef<number>(0);
   const autoFetchLockRef = useRef(false);
   const lastAutoFetchMapRef = useRef<Map<string, number>>(new Map());
   const activeWorkspaceKeyRef = useRef<string>(
@@ -522,6 +524,13 @@ export default function App() {
         agentAbortRef.current = null;
         void cancelTauriAgent();
       }
+      if (searchAbortRef.current) {
+        searchAbortRef.current.abort();
+        searchAbortRef.current = null;
+      }
+      searchSeqRef.current += 1;
+      setIsSearching(false);
+      setSearchQuery('');
       setIsAgentBusy(false);
 
       const sessionKey = getWorkspaceSessionKey(nextCtx.source, nextCtx.id);
@@ -838,14 +847,39 @@ export default function App() {
   const handleSearchChange = async (query: string, symOnly: boolean) => {
     setSearchQuery(query);
     setSymbolsOnly(symOnly);
+
+    if (searchAbortRef.current) {
+      searchAbortRef.current.abort();
+      searchAbortRef.current = null;
+    }
+    const seq = ++searchSeqRef.current;
+
+    if (symOnly && !query.trim() && allSymbols.length > 0) {
+      setSearchHits(allSymbols);
+      setIsSearching(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     setIsSearching(true);
     try {
-      const hits = await searchWorkspace(workspaceCtx, query, symOnly, tree);
-      setSearchHits(hits);
+      const hits = await searchWorkspace(workspaceCtx, query, symOnly, tree, controller.signal);
+      if (seq === searchSeqRef.current && !controller.signal.aborted) {
+        setSearchHits(hits);
+      }
     } catch (err) {
-      showNotice('error', err instanceof Error ? err.message : 'Search failed');
+      const isAbort =
+        controller.signal.aborted ||
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+      if (!isAbort && seq === searchSeqRef.current) {
+        showNotice('error', err instanceof Error ? err.message : 'Search failed');
+      }
     } finally {
-      setIsSearching(false);
+      if (seq === searchSeqRef.current) {
+        setIsSearching(false);
+      }
     }
   };
 
