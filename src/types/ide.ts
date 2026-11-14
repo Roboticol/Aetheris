@@ -70,6 +70,7 @@ export interface AgentMessage {
   role: 'user' | 'assistant';
   mode?: AgentMode;
   effort?: ModelEffort;
+  autopilot?: boolean;
   content: string;
   thoughts?: string;
   thinkingDurationMs?: number;

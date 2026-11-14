@@ -18,6 +18,7 @@ import {
   Square,
   Trash2,
   X,
+  Zap,
 } from 'lucide-react';
 import {
   AgentActivityItem,
@@ -37,10 +38,12 @@ interface AgentPanelProps {
   effort: ModelEffort;
   agentMode: AgentMode;
   followAi: boolean;
+  autopilot: boolean;
   isBusy: boolean;
   onEffortChange: (effort: ModelEffort) => void;
   onAgentModeChange: (mode: AgentMode) => void;
   onFollowAiChange: (follow: boolean) => void;
+  onAutopilotChange: (autopilot: boolean) => void;
   onSendPrompt: (prompt: string, overrideMode?: AgentMode) => Promise<void>;
   onCancelPrompt: () => void;
   onOpenFile: (filePath: string) => void;
@@ -48,6 +51,8 @@ interface AgentPanelProps {
   onAcceptPatch: (patchId: string) => void;
   onRejectPatch: (patchId: string) => void;
   onAcceptAll: (messageId: string) => void;
+  onAcceptAllPending: () => void;
+  onRejectAllPending: () => void;
   onClearHistory: () => void;
 }
 
@@ -182,10 +187,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   effort,
   agentMode,
   followAi,
+  autopilot,
   isBusy,
   onEffortChange,
   onAgentModeChange,
   onFollowAiChange,
+  onAutopilotChange,
   onSendPrompt,
   onCancelPrompt,
   onOpenFile,
@@ -193,10 +200,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   onAcceptPatch,
   onRejectPatch,
   onAcceptAll,
+  onAcceptAllPending,
+  onRejectAllPending,
   onClearHistory,
 }) => {
   const [prompt, setPrompt] = useState('');
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const allPendingPatches = messages.flatMap((m) =>
+    (m.patches ?? []).filter((p) => p.status === 'pending')
+  );
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -351,6 +364,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                         {msg.mode}
                       </span>
                     )}
+                    {msg.autopilot && (
+                      <span className="inline-flex items-center gap-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+                        <Zap className="h-2.5 w-2.5" />
+                        <span>Autopilot</span>
+                      </span>
+                    )}
                     {msg.effort && msg.role === 'user' && (
                       <span className="text-[10.5px] text-[#8B92A5]">
                         · {msg.effort === 'xhigh' ? 'max' : msg.effort}
@@ -461,14 +480,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                       <span className="text-[11.5px] font-medium text-[#8B92A5] tabular-nums">
                         Proposed Changes ({msg.patches.length})
                       </span>
-                      {pendingPatches.length > 1 && (
+                      {pendingPatches.length > 0 && (
                         <button
                           type="button"
                           onClick={() => onAcceptAll(msg.id)}
-                          className="flex items-center gap-1 text-[11.5px] font-medium text-emerald-400 hover:text-emerald-300 transition-colors"
+                          className="flex items-center gap-1 rounded bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-300 hover:bg-emerald-500/25 transition-colors"
                         >
                           <CheckCheck className="h-3.5 w-3.5" />
-                          <span>Accept All</span>
+                          <span>
+                            Approve All{pendingPatches.length > 1 ? ` (${pendingPatches.length})` : ''}
+                          </span>
                         </button>
                       )}
                     </div>
@@ -550,6 +571,36 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         )}
       </div>
 
+      {/* Staged Files Approval Bar */}
+      {allPendingPatches.length > 0 && (
+        <div className="flex items-center justify-between gap-2 border-t border-[#272B38] bg-[#0F1117]/90 px-3 py-2">
+          <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] font-medium text-[#E6E8EE]">
+            <FileDiff className="h-3.5 w-3.5 shrink-0 text-[#818CF8]" />
+            <span className="truncate tabular-nums">
+              {allPendingPatches.length} staged {allPendingPatches.length === 1 ? 'file' : 'files'}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={onRejectAllPending}
+              className="flex items-center gap-1 rounded border border-[#272B38] bg-[#161922] px-2 py-1 text-[11px] font-medium text-[#8B92A5] hover:text-red-300 transition-colors whitespace-nowrap"
+            >
+              <X className="h-3 w-3" />
+              <span>Reject All</span>
+            </button>
+            <button
+              type="button"
+              onClick={onAcceptAllPending}
+              className="flex items-center gap-1 rounded bg-emerald-600/25 px-2.5 py-1 text-[11px] font-medium text-emerald-300 hover:bg-emerald-600/35 transition-colors whitespace-nowrap"
+            >
+              <CheckCheck className="h-3.5 w-3.5" />
+              <span>Approve All</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Antigravity-style Composer */}
       <form onSubmit={handleSubmit} className="border-t border-[#272B38] p-2.5">
         <div className="rounded-lg border border-[#272B38] bg-[#0F1117] p-2 focus-within:border-[#6366F1] transition-colors">
@@ -569,33 +620,61 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             placeholder={
               agentMode === 'plan'
                 ? 'Plan mode (read-only): describe a feature or refactor...'
-                : 'Action mode: ask Aetheris to inspect, build, or edit files...'
+                : autopilot
+                  ? 'Autopilot active: describe what to build—edits will apply automatically...'
+                  : 'Action mode: ask Aetheris to inspect, build, or edit files...'
             }
             className="w-full resize-none bg-transparent text-[12.5px] text-[#E6E8EE] placeholder-[#52596E] focus:outline-none"
           />
 
-          <div className="mt-2 flex items-center justify-between gap-2">
-            {/* Effort Selector */}
-            <div className="flex items-center gap-1 rounded-md bg-[#161922] p-0.5">
-              <span className="px-1.5 text-[10.5px] font-medium text-[#8B92A5] select-none">
-                Effort
-              </span>
-              {EFFORT_OPTIONS.map((opt) => (
-                <Tooltip key={opt.value} label={`${opt.label} effort: ${opt.hint}`}>
-                  <button
-                    type="button"
-                    disabled={isBusy}
-                    onClick={() => onEffortChange(opt.value)}
-                    className={`rounded px-1.5 py-0.5 text-[10.5px] font-medium transition-colors whitespace-nowrap ${
-                      effort === opt.value
-                        ? 'bg-[#6366F1]/25 text-[#818CF8]'
-                        : 'text-[#8B92A5] hover:text-[#E6E8EE]'
-                    } disabled:opacity-60`}
-                  >
-                    {opt.short}
-                  </button>
-                </Tooltip>
-              ))}
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {/* Effort Selector */}
+              <div className="flex items-center gap-0.5 rounded-md bg-[#161922] p-0.5">
+                <span className="px-1.5 text-[10.5px] font-medium text-[#8B92A5] select-none">
+                  Effort
+                </span>
+                {EFFORT_OPTIONS.map((opt) => (
+                  <Tooltip key={opt.value} label={`${opt.label} effort: ${opt.hint}`}>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => onEffortChange(opt.value)}
+                      className={`rounded px-1.5 py-0.5 text-[10.5px] font-medium transition-colors whitespace-nowrap ${
+                        effort === opt.value
+                          ? 'bg-[#6366F1]/25 text-[#818CF8]'
+                          : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                      } disabled:opacity-60`}
+                    >
+                      {opt.short}
+                    </button>
+                  </Tooltip>
+                ))}
+              </div>
+
+              {/* Autopilot Toggle */}
+              <Tooltip
+                label={
+                  autopilot
+                    ? 'Autopilot ON: agent file changes apply automatically without staging review'
+                    : 'Autopilot OFF: click to automatically approve and apply agent file changes'
+                }
+              >
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  aria-pressed={autopilot}
+                  onClick={() => onAutopilotChange(!autopilot)}
+                  className={`flex items-center gap-1 rounded-md px-2 py-1 text-[10.5px] font-medium transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                    autopilot
+                      ? 'border border-amber-500/40 bg-amber-500/15 text-amber-300'
+                      : 'border border-[#272B38] bg-[#161922] text-[#8B92A5] hover:text-[#E6E8EE]'
+                  }`}
+                >
+                  <Zap className="h-3 w-3" />
+                  <span>Autopilot</span>
+                </button>
+              </Tooltip>
             </div>
 
             {/* Submit OR Cancel Prompt Button */}

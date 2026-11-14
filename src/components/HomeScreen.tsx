@@ -441,6 +441,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </form>
         </section>
       </motion.div>
+
+      <footer className="mx-auto mt-auto w-full max-w-5xl border-t border-[#272B38]/60 pt-4 text-center text-[11.5px] text-[#8B92A5]">
+        Created with <span aria-label="love">❤️</span> by{' '}
+        <span className="font-medium text-[#C7D2FE]">Oishik Guha</span>
+      </footer>
     </div>
   );
 };

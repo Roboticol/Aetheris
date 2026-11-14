@@ -6,6 +6,7 @@ export interface PersistedWorkspaceSession {
   agentMode: AgentMode;
   effort: ModelEffort;
   followAi: boolean;
+  autopilot?: boolean;
   updatedAt: number;
 }
 
@@ -153,6 +154,7 @@ export async function clearWorkspaceSessionMessages(workspaceKey: string): Promi
     agentMode: existing?.agentMode ?? 'action',
     effort: existing?.effort ?? 'medium',
     followAi: existing?.followAi ?? true,
+    autopilot: existing?.autopilot ?? false,
     updatedAt: Date.now(),
   });
 }

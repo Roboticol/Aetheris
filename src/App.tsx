@@ -160,6 +160,7 @@ export default function App() {
   const [effort, setEffort] = useState<ModelEffort>('medium');
   const [agentMode, setAgentMode] = useState<AgentMode>('action');
   const [followAi, setFollowAi] = useState<boolean>(true);
+  const [autopilot, setAutopilot] = useState<boolean>(false);
   const [isAgentBusy, setIsAgentBusy] = useState(false);
   const [activeDiffPatchId, setActiveDiffPatchId] = useState<string | null>(null);
   const [hydratedWorkspaceKey, setHydratedWorkspaceKey] = useState<string | null>(null);
@@ -188,6 +189,11 @@ export default function App() {
     followAiRef.current = followAi;
   }, [followAi]);
 
+  const autopilotRef = useRef(autopilot);
+  useEffect(() => {
+    autopilotRef.current = autopilot;
+  }, [autopilot]);
+
   useEffect(() => {
     try {
       localStorage.setItem(GIT_AUTOFETCH_KEY, String(gitAutoFetch));
@@ -202,6 +208,7 @@ export default function App() {
 
   // Terminal state
   const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
+  const [terminalCwd, setTerminalCwd] = useState<string>('.');
   const [isTerminalRunning, setIsTerminalRunning] = useState(false);
 
   // Inline banner feedback (no window.alert)
@@ -408,12 +415,13 @@ export default function App() {
         agentMode,
         effort,
         followAi,
+        autopilot,
         updatedAt: Date.now(),
       });
     }, isAgentBusy ? 400 : 80);
 
     return () => clearTimeout(timer);
-  }, [agentMessages, agentMode, effort, followAi, isAgentBusy, workspaceCtx, hydratedWorkspaceKey]);
+  }, [agentMessages, agentMode, effort, followAi, autopilot, isAgentBusy, workspaceCtx, hydratedWorkspaceKey]);
 
   const openFile = useCallback(
     async (filePath: string, line?: number) => {
@@ -520,6 +528,7 @@ export default function App() {
       setHydratedWorkspaceKey(null);
       setWorkspaceCtx(nextCtx);
       setTerminalEntries([]);
+      setTerminalCwd('.');
       setActiveDiffPatchId(null);
       setActiveGitDiff(null);
       setGitStatus(null);
@@ -533,8 +542,10 @@ export default function App() {
         setAgentMode(saved.agentMode);
         setEffort(saved.effort);
         setFollowAi(saved.followAi);
+        setAutopilot(Boolean(saved.autopilot));
       } else {
         setAgentMessages([]);
+        setAutopilot(false);
       }
       setHydratedWorkspaceKey(sessionKey);
 
@@ -882,12 +893,15 @@ export default function App() {
 
   const handleExecuteCommand = async (command: string) => {
     setIsTerminalRunning(true);
+    const startCwd = terminalCwd;
     try {
-      const result = await execWorkspaceCommand(workspaceCtx, command, tree);
+      const result = await execWorkspaceCommand(workspaceCtx, command, tree, startCwd);
+      setTerminalCwd(result.cwd || '.');
       setTerminalEntries((prev) => [
         ...prev,
         {
           ...result,
+          cwd: startCwd,
           id: `${Date.now()}-${Math.random()}`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
@@ -910,12 +924,14 @@ export default function App() {
 
   const handleRunAgent = async (prompt: string, overrideMode?: AgentMode) => {
     const effectiveMode = overrideMode ?? agentMode;
+    const isAutopilotRun = autopilotRef.current && effectiveMode === 'action';
     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const userMsg: AgentMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
       mode: effectiveMode,
       effort,
+      autopilot: isAutopilotRun,
       content: prompt,
       timestamp: timeStr,
     };
@@ -925,6 +941,7 @@ export default function App() {
       role: 'assistant',
       mode: effectiveMode,
       effort,
+      autopilot: isAutopilotRun,
       content: '',
       thoughts: '',
       activity: [],
@@ -965,6 +982,7 @@ export default function App() {
         openBuffers,
         effort,
         agentMode: effectiveMode,
+        autopilot: isAutopilotRun,
         history: priorHistory,
         signal: abortController.signal,
         onEvent: (evt) => {
@@ -993,6 +1011,9 @@ export default function App() {
         },
       });
 
+      const autoApproveNow = isAutopilotRun && result.patches.length > 0;
+      const finalPatches = result.patches;
+
       setAgentMessages((prev) =>
         prev.map((m) =>
           m.id === streamId
@@ -1000,7 +1021,7 @@ export default function App() {
                 ...m,
                 content: result.summary,
                 steps: result.steps,
-                patches: result.patches,
+                patches: finalPatches,
                 thoughts: result.thoughts || m.thoughts,
                 thinkingDurationMs: result.thinkingDurationMs,
                 sources: result.sources.length > 0 ? result.sources : undefined,
@@ -1016,8 +1037,16 @@ export default function App() {
         )
       );
 
-      if (result.patches.length > 0 && followAiRef.current) {
-        setActiveDiffPatchId(result.patches[0].id);
+      if (autoApproveNow) {
+        let appliedCount = 0;
+        for (const patch of finalPatches) {
+          await applySinglePatch(patch);
+          appliedCount += 1;
+        }
+        await refreshWorkspace(workspaceCtx, false);
+        showNotice('info', `Autopilot applied ${appliedCount} file change(s).`);
+      } else if (finalPatches.length > 0 && followAiRef.current) {
+        setActiveDiffPatchId(finalPatches[0].id);
       }
     } catch (err) {
       const isAbort =
@@ -1140,8 +1169,47 @@ export default function App() {
         await applySinglePatch(patch);
       }
       await refreshWorkspace(workspaceCtx, false);
+      showNotice('info', `Approved and applied ${pending.length} staged file(s).`);
     } catch (err) {
       showNotice('error', err instanceof Error ? err.message : 'Failed applying patches');
+    }
+  };
+
+  const handleAcceptAllPendingPatches = async () => {
+    const allPending = agentMessages.flatMap((m) =>
+      (m.patches ?? []).filter((p) => p.status === 'pending')
+    );
+    if (allPending.length === 0) return;
+
+    try {
+      for (const patch of allPending) {
+        await applySinglePatch(patch);
+      }
+      await refreshWorkspace(workspaceCtx, false);
+      showNotice('info', `Approved and applied ${allPending.length} staged file(s).`);
+    } catch (err) {
+      showNotice('error', err instanceof Error ? err.message : 'Failed applying staged files');
+    }
+  };
+
+  const handleRejectAllPendingPatches = () => {
+    const pendingIds = new Set(
+      agentMessages.flatMap((m) =>
+        (m.patches ?? []).filter((p) => p.status === 'pending').map((p) => p.id)
+      )
+    );
+    if (pendingIds.size === 0) return;
+
+    setAgentMessages((prev) =>
+      prev.map((m) => ({
+        ...m,
+        patches: m.patches?.map((p) =>
+          p.status === 'pending' ? { ...p, status: 'rejected' } : p
+        ),
+      }))
+    );
+    if (activeDiffPatchId && pendingIds.has(activeDiffPatchId)) {
+      setActiveDiffPatchId(null);
     }
   };
 
@@ -1438,7 +1506,8 @@ export default function App() {
           />
         </main>
       ) : (
-      /* Main 3-column workbench with resizable panels */
+      <>
+      {/* Main 3-column workbench with resizable panels */}
       <main className="flex flex-1 min-h-0 overflow-hidden">
         {showLeftSidebar && (
           <>
@@ -1674,6 +1743,7 @@ export default function App() {
               <TerminalDrawer
                 height={panelSizes.terminalHeight}
                 workspaceName={workspaceCtx.name}
+                cwd={terminalCwd}
                 entries={terminalEntries}
                 isRunning={isTerminalRunning}
                 onExecute={handleExecuteCommand}
@@ -1704,10 +1774,12 @@ export default function App() {
               effort={effort}
               agentMode={agentMode}
               followAi={followAi}
+              autopilot={autopilot}
               isBusy={isAgentBusy}
               onEffortChange={setEffort}
               onAgentModeChange={setAgentMode}
               onFollowAiChange={setFollowAi}
+              onAutopilotChange={setAutopilot}
               onSendPrompt={handleRunAgent}
               onCancelPrompt={handleCancelAgent}
               onOpenFile={(p) => void openFile(p)}
@@ -1718,6 +1790,8 @@ export default function App() {
               onAcceptPatch={handleAcceptPatch}
               onRejectPatch={handleRejectPatch}
               onAcceptAll={handleAcceptAllPatches}
+              onAcceptAllPending={handleAcceptAllPendingPatches}
+              onRejectAllPending={handleRejectAllPendingPatches}
               onClearHistory={() => {
                 setAgentMessages([]);
                 setActiveDiffPatchId(null);
@@ -1729,6 +1803,27 @@ export default function App() {
           </>
         )}
       </main>
+      <footer className="flex h-6 shrink-0 items-center justify-between border-t border-[#272B38] bg-[#161922] px-3 text-[11px] leading-none text-[#8B92A5] select-none">
+        <div className="flex items-center gap-2 truncate font-mono">
+          <span className="truncate text-[#B5BBC9]">{workspaceCtx.name}</span>
+          {gitStatus?.isRepo && gitStatus.branch && (
+            <>
+              <span className="text-[#52596E]" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-[#818CF8]">{gitStatus.branch}</span>
+            </>
+          )}
+        </div>
+        <div className="shrink-0 font-mono text-[11px] leading-none">
+          Created with{' '}
+          <span aria-label="love" className="inline-block text-[9.5px] leading-none">
+            ❤️
+          </span>{' '}
+          by <span className="text-[#C7D2FE]">Oishik Guha</span>
+        </div>
+      </footer>
+      </>
       )}
 
       <CommandPalette

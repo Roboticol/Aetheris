@@ -6,6 +6,7 @@ import { Tooltip } from './Tooltip';
 interface TerminalDrawerProps {
   height: number;
   workspaceName: string;
+  cwd: string;
   entries: TerminalEntry[];
   isRunning: boolean;
   onExecute: (command: string) => Promise<void>;
@@ -13,9 +14,21 @@ interface TerminalDrawerProps {
   onClose: () => void;
 }
 
+function formatCwdLabel(cwd: string, workspaceName: string): string {
+  if (!cwd || cwd === '.') return workspaceName;
+  if (cwd.startsWith('/') || /^[A-Za-z]:/.test(cwd)) return cwd;
+  return `${workspaceName}/${cwd}`;
+}
+
+function formatPromptPrefix(cwd: string): string {
+  if (!cwd || cwd === '.') return '~';
+  return cwd;
+}
+
 export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
   height,
   workspaceName,
+  cwd,
   entries,
   isRunning,
   onExecute,
@@ -69,22 +82,27 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
     }
   };
 
+  const headerCwdLabel = formatCwdLabel(cwd, workspaceName);
+  const activePromptPrefix = formatPromptPrefix(cwd);
+
   return (
     <section
       style={{ height }}
       className="flex shrink-0 flex-col border-t border-[#272B38] bg-[#161922] min-h-0"
     >
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-[#272B38] px-3 select-none">
-        <div className="flex items-center gap-2 text-[12px] font-medium text-[#E6E8EE]">
-          <TerminalIcon className="h-3.5 w-3.5 text-[#818CF8]" />
-          <span>Terminal</span>
-          <span className="text-[#52596E]" aria-hidden="true">
+        <div className="flex min-w-0 items-center gap-2 text-[12px] font-medium text-[#E6E8EE]">
+          <TerminalIcon className="h-3.5 w-3.5 shrink-0 text-[#818CF8]" />
+          <span className="shrink-0">Terminal</span>
+          <span className="text-[#52596E] shrink-0" aria-hidden="true">
             ·
           </span>
-          <span className="font-mono text-[11px] text-[#8B92A5]">{workspaceName}</span>
+          <span className="truncate font-mono text-[11px] text-[#8B92A5]" title={headerCwdLabel}>
+            {headerCwdLabel}
+          </span>
         </div>
 
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
           <Tooltip label="Clear Terminal">
             <button
               type="button"
@@ -115,9 +133,9 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
       >
         {entries.length === 0 ? (
           <div className="text-[#8B92A5]">
-            Run shell commands inside <span className="text-[#E6E8EE]">{workspaceName}</span>{' '}
-            (for example: <code className="text-[#818CF8]">ls -la</code>,{' '}
-            <code className="text-[#818CF8]">grep -rn "fn " src</code>, or{' '}
+            Run shell commands inside <span className="text-[#E6E8EE]">{headerCwdLabel}</span>{' '}
+            (for example: <code className="text-[#818CF8]">cd src</code>,{' '}
+            <code className="text-[#818CF8]">ls -la</code>, or{' '}
             <code className="text-[#818CF8]">node --version</code>).
           </div>
         ) : (
@@ -125,12 +143,15 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
             {entries.map((entry) => (
               <div key={entry.id} className="space-y-1">
                 <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2 text-[#E6E8EE]">
-                    <span className="text-[#818CF8]">$</span>
-                    <span>{entry.command}</span>
+                  <div className="flex min-w-0 items-center gap-1.5 text-[#E6E8EE]">
+                    <span className="shrink-0 text-[#8B92A5]">
+                      {formatPromptPrefix(entry.cwd)}
+                    </span>
+                    <span className="shrink-0 text-[#818CF8]">$</span>
+                    <span className="break-all">{entry.command}</span>
                   </div>
                   <span
-                    className={`tabular-nums text-[11px] ${
+                    className={`shrink-0 tabular-nums text-[11px] ${
                       entry.exitCode === 0 ? 'text-emerald-400' : 'text-red-400'
                     }`}
                   >
@@ -157,7 +178,12 @@ export const TerminalDrawer: React.FC<TerminalDrawerProps> = ({
         onSubmit={handleSubmit}
         className="flex h-9 shrink-0 items-center gap-2 border-t border-[#272B38] bg-[#0F1117] px-3"
       >
-        <span className="font-mono text-[12px] text-[#818CF8]">$</span>
+        <div className="flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
+          <span className="max-w-[160px] truncate text-[#8B92A5]" title={headerCwdLabel}>
+            {activePromptPrefix}
+          </span>
+          <span className="text-[#818CF8]">$</span>
+        </div>
         <input
           ref={inputRef}
           type="text"

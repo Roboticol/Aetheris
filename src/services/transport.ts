@@ -394,53 +394,132 @@ export async function searchWorkspace(
   return data.hits ?? [];
 }
 
+function resolveVirtualPath(tree: FileNode[], cwd: string, target?: string): string | null {
+  const baseParts = cwd === '.' || !cwd ? [] : cwd.split('/').filter(Boolean);
+  const rawTarget = (target ?? '').trim();
+
+  if (!rawTarget || rawTarget === '~' || rawTarget === '/') {
+    return '.';
+  }
+
+  const nextParts = rawTarget.startsWith('/') ? [] : [...baseParts];
+  for (const seg of rawTarget.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      nextParts.pop();
+    } else {
+      nextParts.push(seg);
+    }
+  }
+
+  if (nextParts.length === 0) return '.';
+
+  let nodes = tree;
+  for (let i = 0; i < nextParts.length; i++) {
+    const found = nodes.find((n) => n.name === nextParts[i] && n.kind === 'dir');
+    if (!found) return null;
+    nodes = found.children ?? [];
+  }
+  return nextParts.join('/');
+}
+
+function getVirtualDirChildren(tree: FileNode[], relDir: string): FileNode[] {
+  if (relDir === '.' || !relDir) return tree;
+  let nodes = tree;
+  for (const seg of relDir.split('/').filter(Boolean)) {
+    const found = nodes.find((n) => n.name === seg && n.kind === 'dir');
+    if (!found) return [];
+    nodes = found.children ?? [];
+  }
+  return nodes;
+}
+
 export async function execWorkspaceCommand(
   ctx: ActiveWorkspaceContext,
   command: string,
-  tree: FileNode[]
+  tree: FileNode[],
+  currentCwd = '.'
 ): Promise<Omit<TerminalEntry, 'id' | 'timestamp'>> {
   if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
-    const out = await tauriInvoke<{ stdout: string; stderr: string; exitCode: number }>(
+    const out = await tauriInvoke<{ stdout: string; stderr: string; exitCode: number; cwd?: string }>(
       'exec_terminal_command',
-      { root: ctx.nativeRoot, command }
+      { root: ctx.nativeRoot, command, cwd: currentCwd }
     );
     return {
       command,
       stdout: out.stdout,
       stderr: out.stderr,
       exitCode: out.exitCode,
-      cwd: ctx.nativeRoot,
+      cwd: out.cwd ?? currentCwd,
     };
   }
 
   if (ctx.source === 'local-fs') {
-    const trimmed = command.trim();
-    if (trimmed === 'pwd') {
-      return { command, stdout: `${ctx.name}\n`, stderr: '', exitCode: 0, cwd: ctx.name };
+    const segments = command
+      .split(/\s*&&\s*/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let cwd = currentCwd || '.';
+    let stdout = '';
+    let stderr = '';
+    let exitCode = 0;
+
+    for (const seg of segments) {
+      if (seg === 'cd' || seg.startsWith('cd ')) {
+        const arg = seg.slice(2).trim().replace(/^["']|["']$/g, '');
+        const resolved = resolveVirtualPath(tree, cwd, arg);
+        if (resolved === null) {
+          stderr += `cd: no such directory: ${arg}\n`;
+          exitCode = 1;
+          break;
+        }
+        cwd = resolved;
+        continue;
+      }
+
+      if (seg === 'pwd') {
+        stdout += cwd === '.' ? `${ctx.name}\n` : `${ctx.name}/${cwd}\n`;
+        continue;
+      }
+
+      if (seg === 'ls' || seg.startsWith('ls ')) {
+        const arg = seg
+          .slice(2)
+          .trim()
+          .split(/\s+/)
+          .filter((t) => t && !t.startsWith('-'))[0];
+        const targetDir = arg ? resolveVirtualPath(tree, cwd, arg) : cwd;
+        if (targetDir === null) {
+          stderr += `ls: cannot access '${arg}': No such file or directory\n`;
+          exitCode = 1;
+          break;
+        }
+        const children = getVirtualDirChildren(tree, targetDir);
+        const listing = children.map((n) => (n.kind === 'dir' ? `${n.name}/` : n.name)).join('  ');
+        stdout += listing ? `${listing}\n` : '';
+        continue;
+      }
+
+      stderr +=
+        'Browser security isolates local folder handles from OS shell spawning. Use the Native Rust/Tauri build on Linux/Windows for full PTY shell execution on local folders, or switch to a starter workspace to run live commands here.\n';
+      exitCode = 1;
+      break;
     }
-    if (trimmed === 'ls' || trimmed.startsWith('ls ')) {
-      const listing = tree.map((n) => (n.kind === 'dir' ? `${n.name}/` : n.name)).join('  ');
-      return { command, stdout: `${listing}\n`, stderr: '', exitCode: 0, cwd: ctx.name };
-    }
-    return {
-      command,
-      stdout: '',
-      stderr:
-        'Browser security isolates local folder handles from OS shell spawning. Use the Native Rust/Tauri build on Linux/Windows for full PTY shell execution on local folders, or switch to a starter workspace to run live commands here.',
-      exitCode: 1,
-      cwd: ctx.name,
-    };
+
+    return { command, stdout, stderr, exitCode, cwd };
   }
 
   const res = await fetch(`/api/workspaces/${encodeURIComponent(ctx.id)}/terminal`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command }),
+    body: JSON.stringify({ command, cwd: currentCwd }),
   });
   const data = (await res.json()) as {
     stdout?: string;
     stderr?: string;
     exitCode?: number;
+    cwd?: string;
     error?: string;
   };
   if (!res.ok) {
@@ -451,7 +530,7 @@ export async function execWorkspaceCommand(
     stdout: data.stdout ?? '',
     stderr: data.stderr ?? '',
     exitCode: data.exitCode ?? 0,
-    cwd: `~/${ctx.name}`,
+    cwd: data.cwd ?? currentCwd,
   };
 }
 
@@ -470,6 +549,7 @@ export async function runAgentPlan(params: {
   openBuffers: Record<string, string>;
   effort: ModelEffort;
   agentMode: AgentMode;
+  autopilot?: boolean;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
   signal?: AbortSignal;
   onEvent?: (event: AgentStreamEvent) => void;
@@ -490,6 +570,7 @@ export async function runAgentPlan(params: {
     openBuffers,
     effort,
     agentMode,
+    autopilot,
     history,
     signal,
     onEvent,
@@ -544,6 +625,7 @@ export async function runAgentPlan(params: {
         openBuffers,
         effort,
         agentMode,
+        autopilot: Boolean(autopilot),
         history,
       });
 
@@ -606,6 +688,7 @@ export async function runAgentPlan(params: {
         files: localFiles,
         effort,
         agentMode,
+        autopilot: Boolean(autopilot),
         history,
       }),
     });

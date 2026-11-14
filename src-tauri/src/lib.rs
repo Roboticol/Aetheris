@@ -41,6 +41,7 @@ pub struct TerminalOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub cwd: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -371,20 +372,58 @@ fn search_workspace(root: String, query: String, symbols_only: bool) -> Result<V
 }
 
 #[tauri::command]
-async fn exec_terminal_command(root: String, command: String) -> Result<TerminalOutput, String> {
+async fn exec_terminal_command(
+    root: String,
+    command: String,
+    cwd: Option<String>,
+) -> Result<TerminalOutput, String> {
     let root_path = PathBuf::from(&root);
+    let root_canonical = fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+
+    let start_dir = match cwd.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != ".") {
+        Some(c) => {
+            let candidate = {
+                let p = PathBuf::from(c);
+                if p.is_absolute() {
+                    p
+                } else {
+                    root_canonical.join(p)
+                }
+            };
+            if candidate.is_dir() {
+                fs::canonicalize(&candidate).unwrap_or(candidate)
+            } else {
+                root_canonical.clone()
+            }
+        }
+        None => root_canonical.clone(),
+    };
+
+    let cmd_clone = command.clone();
+    let start_dir_clone = start_dir.clone();
     let output = tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "windows")]
-        let out = Command::new("cmd")
-            .args(["/C", &command])
-            .current_dir(&root_path)
-            .output();
+        let out = {
+            let wrapped = format!(
+                "{} & set __AETHERIS_EC=%errorlevel% & echo __AETHERIS_CWD__:%CD% & exit /b %__AETHERIS_EC%",
+                cmd_clone
+            );
+            Command::new("cmd")
+                .args(["/C", &wrapped])
+                .current_dir(&start_dir_clone)
+                .output()
+        };
 
         #[cfg(not(target_os = "windows"))]
-        let out = Command::new("sh")
-            .args(["-c", &command])
-            .current_dir(&root_path)
-            .output();
+        let out = {
+            let wrapped = "eval \"$AETHERIS_CMD\"\n__aetheris_ec=$?\nprintf '\\n__AETHERIS_CWD__:%s\\n' \"$(pwd -P)\"\nexit $__aetheris_ec";
+            Command::new("sh")
+                .args(["-c", wrapped])
+                .env("AETHERIS_CMD", &cmd_clone)
+                .env("TERM", "dumb")
+                .current_dir(&start_dir_clone)
+                .output()
+        };
 
         out
     })
@@ -392,10 +431,41 @@ async fn exec_terminal_command(root: String, command: String) -> Result<Terminal
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
+    let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let marker_re = Regex::new(r"(?m)\r?\n?__AETHERIS_CWD__:([^\r\n]+)\r?\n?\z").ok();
+
+    let mut next_cwd = if let Ok(rel) = start_dir.strip_prefix(&root_canonical) {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if s.is_empty() { ".".to_string() } else { s }
+    } else {
+        start_dir.to_string_lossy().replace('\\', "/")
+    };
+
+    if let Some(re) = marker_re {
+        if let Some(caps) = re.captures(&stdout) {
+            if let (Some(full_m), Some(path_m)) = (caps.get(0), caps.get(1)) {
+                let captured = path_m.as_str().trim().to_string();
+                let cut_at = full_m.start();
+                stdout.truncate(cut_at);
+                if !captured.is_empty() {
+                    let cap_path = PathBuf::from(&captured);
+                    let cap_canon = fs::canonicalize(&cap_path).unwrap_or(cap_path);
+                    next_cwd = if let Ok(rel) = cap_canon.strip_prefix(&root_canonical) {
+                        let s = rel.to_string_lossy().replace('\\', "/");
+                        if s.is_empty() { ".".to_string() } else { s }
+                    } else {
+                        cap_canon.to_string_lossy().replace('\\', "/")
+                    };
+                }
+            }
+        }
+    }
+
     Ok(TerminalOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stdout,
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         exit_code: output.status.code().unwrap_or(1),
+        cwd: next_cwd,
     })
 }
 
@@ -975,6 +1045,7 @@ async fn run_gemini_agent(
     open_buffers: Option<HashMap<String, String>>,
     effort: Option<String>,
     agent_mode: Option<String>,
+    autopilot: Option<bool>,
     history: Option<Vec<ChatTurnInput>>,
 ) -> Result<AgentPlanResponse, String> {
     let api_key = resolve_gemini_api_key()?;
@@ -1125,10 +1196,13 @@ async fn run_gemini_agent(
         vec![list_decl, read_decl, search_decl, edit_decl, create_decl, delete_decl]
     };
 
+    let autopilot_enabled = !is_plan_mode && autopilot.unwrap_or(false);
     let system_prompt = if is_plan_mode {
-        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block."
+        "You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.".to_string()
+    } else if autopilot_enabled {
+        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets). AUTOPILOT IS ENABLED: Execute the user request completely end-to-end without pausing to ask for permission or confirmation; stage every required edit, creation, and deletion in this run so they can be applied automatically.".to_string()
     } else {
-        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets)."
+        "You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).".to_string()
     };
 
     let mut contents: Vec<serde_json::Value> = history

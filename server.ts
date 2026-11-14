@@ -867,16 +867,47 @@ async function startServer() {
 
   app.post('/api/workspaces/:id/terminal', async (req, res) => {
     try {
-      const { command } = req.body as { command: string };
+      const { command, cwd } = req.body as { command: string; cwd?: string };
       if (!command || !command.trim()) {
         res.status(400).json({ error: 'Command cannot be empty' });
         return;
       }
       const { root } = resolveSafeWorkspacePath(req.params.id);
+      const realRoot = await fs.realpath(root);
 
-      const child = spawn('sh', ['-c', command], {
-        cwd: root,
-        env: { ...process.env, TERM: 'dumb' },
+      let startCwd = realRoot;
+      let startRelCwd = '.';
+      if (cwd && cwd.trim() && cwd.trim() !== '.') {
+        try {
+          const candidate = path.resolve(realRoot, cwd.trim());
+          const candidateReal = await fs.realpath(candidate);
+          const relFromRoot = path.relative(realRoot, candidateReal);
+          if (
+            relFromRoot === '' ||
+            (!relFromRoot.startsWith('..') && !path.isAbsolute(relFromRoot))
+          ) {
+            const stat = await fs.stat(candidateReal);
+            if (stat.isDirectory()) {
+              startCwd = candidateReal;
+              startRelCwd = relFromRoot ? relFromRoot.split(path.sep).join('/') : '.';
+            }
+          }
+        } catch {
+          // Fallback to workspace root if prior directory no longer exists
+        }
+      }
+
+      const wrappedScript =
+        'eval "$AETHERIS_CMD"\n__aetheris_ec=$?\nprintf \'\\n__AETHERIS_CWD__:%s\\n\' "$(pwd -P)"\nexit $__aetheris_ec';
+
+      const child = spawn('sh', ['-c', wrappedScript], {
+        cwd: startCwd,
+        env: {
+          ...process.env,
+          HOME: realRoot,
+          TERM: 'dumb',
+          AETHERIS_CMD: command,
+        },
       });
 
       let stdout = '';
@@ -901,10 +932,30 @@ async function startServer() {
         if (killedByTimeout) {
           stderr += '\nProcess terminated after 15s command timeout.';
         }
+
+        let nextRelCwd = startRelCwd;
+        const markerRe = /\r?\n?__AETHERIS_CWD__:([^\r\n]+)\r?\n?$/;
+        const match = markerRe.exec(stdout);
+        if (match) {
+          const capturedAbs = match[1].trim();
+          stdout = stdout.slice(0, match.index);
+          if (capturedAbs) {
+            const relFromRoot = path.relative(realRoot, path.resolve(capturedAbs));
+            if (relFromRoot === '') {
+              nextRelCwd = '.';
+            } else if (!relFromRoot.startsWith('..') && !path.isAbsolute(relFromRoot)) {
+              nextRelCwd = relFromRoot.split(path.sep).join('/');
+            } else {
+              nextRelCwd = '.';
+            }
+          }
+        }
+
         res.json({
           stdout,
           stderr,
           exitCode: code ?? 1,
+          cwd: nextRelCwd,
         });
       });
 
@@ -941,6 +992,7 @@ async function startServer() {
         files,
         effort,
         agentMode,
+        autopilot,
         history,
       } = req.body as {
         workspaceId?: string;
@@ -950,6 +1002,7 @@ async function startServer() {
         files?: Array<{ path: string; content: string }>;
         effort?: 'low' | 'medium' | 'high' | 'xhigh';
         agentMode?: 'plan' | 'action';
+        autopilot?: boolean;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
       };
 
@@ -1466,9 +1519,14 @@ async function startServer() {
       const maxTurns =
         effort === 'xhigh' ? 24 : effort === 'high' ? 18 : effort === 'low' ? 8 : 14;
 
+      const autopilotClause =
+        !isPlanMode && autopilot
+          ? ' AUTOPILOT IS ENABLED: Execute the user request completely end-to-end without pausing to ask for permission or confirmation; stage every required edit, creation, and deletion in this run so they can be applied automatically.'
+          : '';
+
       const systemInstruction = isPlanMode
         ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.'
-        : 'You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).';
+        : `You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).${autopilotClause}`;
 
       const priorTurns: Content[] = (history ?? [])
         .filter((h) => h.content && h.content.trim())
