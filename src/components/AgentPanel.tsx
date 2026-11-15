@@ -1,11 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowUp,
+  AtSign,
   Brain,
   Check,
   CheckCheck,
   ChevronDown,
   ChevronRight,
+  Database,
   ExternalLink,
   Eye,
   FileCode2,
@@ -14,8 +16,10 @@ import {
   ListChecks,
   Loader2,
   Play,
+  Server,
   Sparkles,
   Square,
+  Terminal,
   Trash2,
   X,
   Zap,
@@ -25,7 +29,9 @@ import {
   AgentMessage,
   AgentMode,
   AgentPatch,
+  McpServerSnapshot,
   ModelEffort,
+  PinnedContextItem,
 } from '../types/ide';
 import { Tooltip } from './Tooltip';
 import { MarkdownContent } from './MarkdownContent';
@@ -35,6 +41,10 @@ interface AgentPanelProps {
   messages: AgentMessage[];
   activeFilePath: string | null;
   workspaceFileCount: number;
+  workspaceFiles: string[];
+  activeProviderLabel: string;
+  mcpServers: McpServerSnapshot[];
+  pinnedContext: PinnedContextItem[];
   effort: ModelEffort;
   agentMode: AgentMode;
   followAi: boolean;
@@ -44,6 +54,10 @@ interface AgentPanelProps {
   onAgentModeChange: (mode: AgentMode) => void;
   onFollowAiChange: (follow: boolean) => void;
   onAutopilotChange: (autopilot: boolean) => void;
+  onAddPinnedContext: (item: PinnedContextItem) => void;
+  onRemovePinnedContext: (id: string) => void;
+  onApplyMcpPrompt: (serverId: string, promptName: string) => Promise<string | null>;
+  onOpenSettings: (tab?: 'providers' | 'mcp') => void;
   onSendPrompt: (prompt: string, overrideMode?: AgentMode) => Promise<void>;
   onCancelPrompt: () => void;
   onOpenFile: (filePath: string) => void;
@@ -184,6 +198,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   messages,
   activeFilePath,
   workspaceFileCount,
+  workspaceFiles,
+  activeProviderLabel,
+  mcpServers,
+  pinnedContext,
   effort,
   agentMode,
   followAi,
@@ -193,6 +211,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   onAgentModeChange,
   onFollowAiChange,
   onAutopilotChange,
+  onAddPinnedContext,
+  onRemovePinnedContext,
+  onApplyMcpPrompt,
+  onOpenSettings,
   onSendPrompt,
   onCancelPrompt,
   onOpenFile,
@@ -205,7 +227,15 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   onClearHistory,
 }) => {
   const [prompt, setPrompt] = useState('');
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const [contextFilter, setContextFilter] = useState('');
+  const [contextCategory, setContextCategory] = useState<'mcp' | 'files' | 'prompts'>('mcp');
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const connectedMcpServers = mcpServers.filter((s) => s.status === 'connected');
+  const availableMcpResources = connectedMcpServers.flatMap((s) => s.resources);
+  const availableMcpPrompts = connectedMcpServers.flatMap((s) => s.prompts);
+  const enabledMcpToolsCount = connectedMcpServers.reduce((sum, s) => sum + s.tools.length, 0);
 
   const allPendingPatches = messages.flatMap((m) =>
     (m.patches ?? []).filter((p) => p.status === 'pending')
@@ -312,11 +342,20 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </>
           )}
         </div>
-        {isBusy && (
+        {isBusy ? (
           <span className="flex items-center gap-1 text-[11px] font-medium text-[#818CF8] shrink-0">
             <Loader2 className="h-3 w-3 animate-spin" />
             <span>Running</span>
           </span>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onOpenSettings('providers')}
+            title="Configure AI Provider or Model Context Protocol"
+            className="truncate font-mono text-[11px] text-[#8B92A5] hover:text-[#C7D2FE] transition-colors shrink-0 max-w-[165px]"
+          >
+            {activeProviderLabel}
+          </button>
         )}
       </div>
 
@@ -426,7 +465,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   <div className="rounded-md border border-[#272B38]/80 bg-[#0F1117]/70 px-2.5 py-2 space-y-1.5">
                     <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-[#8B92A5]">
                       <Globe className="h-3 w-3 text-sky-400" />
-                      <span>Google Search Sources</span>
+                      <span>Web Search Sources</span>
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       {msg.sources.map((src) => (
@@ -602,8 +641,220 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       )}
 
       {/* Antigravity-style Composer */}
-      <form onSubmit={handleSubmit} className="border-t border-[#272B38] p-2.5">
+      <form onSubmit={handleSubmit} className="relative border-t border-[#272B38] p-2.5">
+        {/* Interactive MCP & File Context Picker Popover */}
+        {contextMenuOpen && (
+          <>
+            <div
+              className="fixed inset-0 z-30"
+              onClick={() => setContextMenuOpen(false)}
+            />
+            <div className="absolute bottom-full left-2.5 right-2.5 z-40 mb-1.5 flex max-h-72 flex-col overflow-hidden rounded-lg border border-[#272B38] bg-[#161922] shadow-2xl">
+              <div className="flex items-center justify-between border-b border-[#272B38] px-2.5 py-1.5">
+                <div className="flex items-center gap-1 rounded bg-[#0F1117] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setContextCategory('mcp')}
+                    className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap ${
+                      contextCategory === 'mcp'
+                        ? 'bg-[#6366F1]/25 text-[#818CF8]'
+                        : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                    }`}
+                  >
+                    MCP Resources ({availableMcpResources.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setContextCategory('prompts')}
+                    className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap ${
+                      contextCategory === 'prompts'
+                        ? 'bg-[#6366F1]/25 text-[#818CF8]'
+                        : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                    }`}
+                  >
+                    Prompts ({availableMcpPrompts.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setContextCategory('files')}
+                    className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors whitespace-nowrap ${
+                      contextCategory === 'files'
+                        ? 'bg-[#6366F1]/25 text-[#818CF8]'
+                        : 'text-[#8B92A5] hover:text-[#E6E8EE]'
+                    }`}
+                  >
+                    Files
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContextMenuOpen(false);
+                    onOpenSettings('mcp');
+                  }}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10.5px] text-[#818CF8] hover:bg-[#1E222E] whitespace-nowrap shrink-0"
+                >
+                  <Server className="h-3 w-3" />
+                  <span>MCP ({enabledMcpToolsCount} tools)</span>
+                </button>
+              </div>
+
+              {contextCategory === 'files' && (
+                <div className="border-b border-[#272B38] px-2.5 py-1.5">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={contextFilter}
+                    onChange={(e) => setContextFilter(e.target.value)}
+                    placeholder="Filter workspace files..."
+                    className="w-full rounded border border-[#272B38] bg-[#0F1117] px-2 py-1 font-mono text-[11.5px] text-[#E6E8EE] placeholder-[#52596E] focus:border-[#6366F1] focus:outline-none"
+                  />
+                </div>
+              )}
+
+              <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
+                {contextCategory === 'mcp' &&
+                  (availableMcpResources.length === 0 ? (
+                    <div className="px-2 py-3 text-[11.5px] text-[#8B92A5]">
+                      No MCP resources enabled. Open MCP Settings to enable servers.
+                    </div>
+                  ) : (
+                    availableMcpResources.map((resItem) => {
+                      const itemId = `mcp:${resItem.serverId}:${resItem.uri}`;
+                      const alreadyPinned = pinnedContext.some((p) => p.id === itemId);
+                      return (
+                        <button
+                          key={itemId}
+                          type="button"
+                          onClick={() => {
+                            onAddPinnedContext({
+                              id: itemId,
+                              kind: 'mcp-resource',
+                              label: resItem.name,
+                              serverId: resItem.serverId,
+                              uri: resItem.uri,
+                              description: resItem.description,
+                            });
+                            setContextMenuOpen(false);
+                          }}
+                          className="flex w-full items-start justify-between gap-2 rounded px-2 py-1.5 text-left hover:bg-[#1E222E] transition-colors"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-[#E6E8EE]">
+                              <Database className="h-3 w-3 shrink-0 text-emerald-400" />
+                              <span className="truncate">{resItem.name}</span>
+                            </div>
+                            <div className="truncate font-mono text-[10.5px] text-[#8B92A5]">
+                              {resItem.uri}
+                            </div>
+                          </div>
+                          {alreadyPinned && (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-[#818CF8]" />
+                          )}
+                        </button>
+                      );
+                    })
+                  ))}
+
+                {contextCategory === 'prompts' &&
+                  (availableMcpPrompts.length === 0 ? (
+                    <div className="px-2 py-3 text-[11.5px] text-[#8B92A5]">
+                      No MCP prompt templates available.
+                    </div>
+                  ) : (
+                    availableMcpPrompts.map((pr) => (
+                      <button
+                        key={`${pr.serverId}:${pr.name}`}
+                        type="button"
+                        onClick={async () => {
+                          setContextMenuOpen(false);
+                          const text = await onApplyMcpPrompt(pr.serverId, pr.name);
+                          if (text) {
+                            setPrompt(text);
+                          }
+                        }}
+                        className="flex w-full flex-col gap-0.5 rounded px-2 py-1.5 text-left hover:bg-[#1E222E] transition-colors"
+                      >
+                        <div className="flex items-center gap-1.5 font-mono text-[11.5px] font-medium text-[#C7D2FE]">
+                          <Terminal className="h-3 w-3 shrink-0 text-amber-400" />
+                          <span>/{pr.name}</span>
+                        </div>
+                        {pr.description && (
+                          <div className="text-[11px] text-[#8B92A5]">{pr.description}</div>
+                        )}
+                      </button>
+                    ))
+                  ))}
+
+                {contextCategory === 'files' &&
+                  workspaceFiles
+                    .filter((f) =>
+                      !contextFilter.trim()
+                        ? true
+                        : f.toLowerCase().includes(contextFilter.trim().toLowerCase())
+                    )
+                    .slice(0, 40)
+                    .map((filePath) => {
+                      const itemId = `file:${filePath}`;
+                      const alreadyPinned = pinnedContext.some((p) => p.id === itemId);
+                      return (
+                        <button
+                          key={filePath}
+                          type="button"
+                          onClick={() => {
+                            onAddPinnedContext({
+                              id: itemId,
+                              kind: 'file',
+                              label: filePath.split('/').pop() ?? filePath,
+                              path: filePath,
+                            });
+                            setContextMenuOpen(false);
+                          }}
+                          className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left hover:bg-[#1E222E] transition-colors"
+                        >
+                          <span className="truncate font-mono text-[11.5px] text-[#E6E8EE]">
+                            {filePath}
+                          </span>
+                          {alreadyPinned && (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-[#818CF8]" />
+                          )}
+                        </button>
+                      );
+                    })}
+              </div>
+            </div>
+          </>
+        )}
+
         <div className="rounded-lg border border-[#272B38] bg-[#0F1117] p-2 focus-within:border-[#6366F1] transition-colors">
+          {/* Pinned MCP Resources & Files Row */}
+          {pinnedContext.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-1 border-b border-[#272B38]/70 pb-1.5">
+              {pinnedContext.map((item) => (
+                <span
+                  key={item.id}
+                  className="inline-flex items-center gap-1 rounded border border-[#272B38] bg-[#161922] px-1.5 py-0.5 text-[11px] text-[#C7D2FE]"
+                >
+                  {item.kind === 'mcp-resource' ? (
+                    <Database className="h-2.5 w-2.5 shrink-0 text-emerald-400" />
+                  ) : (
+                    <FileCode2 className="h-2.5 w-2.5 shrink-0 text-[#818CF8]" />
+                  )}
+                  <span className="max-w-[140px] truncate font-mono">{item.label}</span>
+                  <button
+                    type="button"
+                    onClick={() => onRemovePinnedContext(item.id)}
+                    aria-label={`Remove ${item.label}`}
+                    className="rounded p-0.5 text-[#8B92A5] hover:text-white"
+                  >
+                    <X className="h-2.5 w-2.5" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
           <textarea
             rows={3}
             value={prompt}
@@ -629,6 +880,26 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
           <div className="mt-2 flex flex-wrap items-center justify-between gap-1.5">
             <div className="flex flex-wrap items-center gap-1.5">
+              {/* Attach MCP / File Context Button */}
+              <Tooltip label="Attach MCP Context Resources, Prompts, or Files">
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => setContextMenuOpen((prev) => !prev)}
+                  className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[10.5px] font-medium transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                    pinnedContext.length > 0 || contextMenuOpen
+                      ? 'border-[#6366F1]/60 bg-[#6366F1]/15 text-[#C7D2FE]'
+                      : 'border-[#272B38] bg-[#161922] text-[#8B92A5] hover:text-[#E6E8EE]'
+                  }`}
+                >
+                  <AtSign className="h-3 w-3" />
+                  <span>Context</span>
+                  {pinnedContext.length > 0 && (
+                    <span className="font-mono tabular-nums">({pinnedContext.length})</span>
+                  )}
+                </button>
+              </Tooltip>
+
               {/* Effort Selector */}
               <div className="flex items-center gap-0.5 rounded-md bg-[#161922] p-0.5">
                 <span className="px-1.5 text-[10.5px] font-medium text-[#8B92A5] select-none">

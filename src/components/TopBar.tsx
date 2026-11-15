@@ -7,6 +7,7 @@ import {
   PanelRight,
   RotateCcw,
   Search,
+  Settings,
 } from 'lucide-react';
 import { WorkspaceSource, WorkspaceSummary } from '../types/ide';
 import { DigitalClock } from './DigitalClock';
@@ -27,6 +28,7 @@ interface TopBarProps {
   onOpenLocalFolder: () => void;
   onSelectStarter: (id: string) => void;
   onResetStarter: () => void;
+  onOpenSettings: () => void;
   onGoHome: () => void;
 }
 
@@ -45,6 +47,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenLocalFolder,
   onSelectStarter,
   onResetStarter,
+  onOpenSettings,
   onGoHome,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -224,6 +227,19 @@ export const TopBar: React.FC<TopBarProps> = ({
             }`}
           >
             <PanelRight className="h-4 w-4" />
+          </button>
+        </Tooltip>
+
+        <div className="mx-0.5 h-4 w-px bg-[#272B38]" />
+
+        <Tooltip label="AI Provider & MCP Settings" shortcut="Ctrl+,">
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            aria-label="Open Settings"
+            className="rounded-md p-1.5 text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#6366F1]"
+          >
+            <Settings className="h-4 w-4" />
           </button>
         </Tooltip>
       </div>

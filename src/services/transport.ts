@@ -2,19 +2,234 @@ import {
   AgentActivityItem,
   AgentMode,
   AgentPatch,
+  AiProviderSettings,
   CreatedProjectSummary,
   FileNode,
   GitDiffPreview,
   GitFileChangeStatus,
   GitStatusSnapshot,
   GroundingSource,
+  McpServerConfig,
+  McpServerSnapshot,
+  McpTransportType,
   ModelEffort,
+  PinnedContextItem,
   RecentWorkspace,
   SearchHit,
+  ServerAiStatus,
   TerminalEntry,
   WorkspaceSource,
   WorkspaceSummary,
 } from '../types/ide';
+
+const AI_SETTINGS_STORAGE_KEY = 'aetheris.aiProviderSettings';
+
+export const DEFAULT_AI_PROVIDER_SETTINGS: AiProviderSettings = {
+  provider: 'gemini',
+  geminiModel: 'gemini-4-hydrogen',
+  openaiBaseUrl: 'https://api.openai.com/v1',
+  openaiModel: 'gpt-4o',
+  enableWebSearch: true,
+};
+
+export function loadAiProviderSettings(): AiProviderSettings {
+  try {
+    const raw = localStorage.getItem(AI_SETTINGS_STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_AI_PROVIDER_SETTINGS };
+    const parsed = JSON.parse(raw) as Partial<AiProviderSettings>;
+    return {
+      provider: parsed.provider === 'openai-compatible' ? 'openai-compatible' : 'gemini',
+      geminiModel: parsed.geminiModel?.trim() || DEFAULT_AI_PROVIDER_SETTINGS.geminiModel,
+      openaiBaseUrl: parsed.openaiBaseUrl?.trim() || DEFAULT_AI_PROVIDER_SETTINGS.openaiBaseUrl,
+      openaiModel: parsed.openaiModel?.trim() || DEFAULT_AI_PROVIDER_SETTINGS.openaiModel,
+      enableWebSearch: parsed.enableWebSearch !== false,
+    };
+  } catch {
+    return { ...DEFAULT_AI_PROVIDER_SETTINGS };
+  }
+}
+
+export function saveAiProviderSettings(settings: AiProviderSettings): void {
+  try {
+    localStorage.setItem(
+      AI_SETTINGS_STORAGE_KEY,
+      JSON.stringify({
+        provider: settings.provider,
+        geminiModel: settings.geminiModel.trim() || DEFAULT_AI_PROVIDER_SETTINGS.geminiModel,
+        openaiBaseUrl: settings.openaiBaseUrl.trim() || DEFAULT_AI_PROVIDER_SETTINGS.openaiBaseUrl,
+        openaiModel: settings.openaiModel.trim() || DEFAULT_AI_PROVIDER_SETTINGS.openaiModel,
+        enableWebSearch: settings.enableWebSearch,
+      })
+    );
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export async function fetchServerAiStatus(): Promise<ServerAiStatus> {
+  if (isTauriRuntime()) {
+    return {
+      geminiConfigured: true,
+      openaiCompatConfigured: false,
+      defaultOpenaiBaseUrl: 'https://api.openai.com/v1',
+      defaultOpenaiModel: 'gpt-4o',
+      mcpEndpointPath: '/api/mcp',
+    };
+  }
+  const res = await fetch('/api/ai/status');
+  if (!res.ok) {
+    throw new Error('Failed to load AI provider status');
+  }
+  return (await res.json()) as ServerAiStatus;
+}
+
+export async function fetchOpenAiModels(baseUrl: string): Promise<string[]> {
+  const res = await fetch('/api/ai/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ baseUrl }),
+  });
+  const data = (await res.json()) as { models?: string[]; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Failed to fetch models');
+  }
+  return Array.isArray(data.models) ? data.models : [];
+}
+
+export async function testAiProviderConnection(
+  providerSettings: AiProviderSettings
+): Promise<{ ok: boolean; latencyMs: number; replyPreview: string }> {
+  const res = await fetch('/api/ai/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ providerSettings }),
+  });
+  const data = (await res.json()) as {
+    ok?: boolean;
+    latencyMs?: number;
+    replyPreview?: string;
+    error?: string;
+  };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Connection check failed');
+  }
+  return {
+    ok: Boolean(data.ok),
+    latencyMs: data.latencyMs ?? 0,
+    replyPreview: data.replyPreview ?? 'Connected',
+  };
+}
+
+export async function fetchMcpServers(): Promise<McpServerSnapshot[]> {
+  if (isTauriRuntime()) return [];
+  try {
+    const res = await fetch('/api/mcp/servers');
+    if (!res.ok) return [];
+    const data = (await res.json()) as { servers?: McpServerSnapshot[] };
+    return Array.isArray(data.servers) ? data.servers : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveMcpServer(
+  server: Partial<McpServerConfig> & { name: string; transport: McpTransportType }
+): Promise<McpServerSnapshot[]> {
+  const res = await fetch('/api/mcp/servers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(server),
+  });
+  const data = (await res.json()) as { servers?: McpServerSnapshot[]; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Failed to save MCP server');
+  }
+  return data.servers ?? [];
+}
+
+export async function toggleMcpServer(
+  id: string,
+  enabled: boolean
+): Promise<McpServerSnapshot[]> {
+  const res = await fetch(`/api/mcp/servers/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  const data = (await res.json()) as { servers?: McpServerSnapshot[]; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Failed to update MCP server');
+  }
+  return data.servers ?? [];
+}
+
+export async function deleteMcpServer(id: string): Promise<McpServerSnapshot[]> {
+  const res = await fetch(`/api/mcp/servers/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  const data = (await res.json()) as { servers?: McpServerSnapshot[]; error?: string };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Failed to remove MCP server');
+  }
+  return data.servers ?? [];
+}
+
+export async function readMcpResourcePreview(params: {
+  serverId: string;
+  uri: string;
+  workspaceId?: string;
+  activeFile?: string | null;
+  openBuffers?: Record<string, string>;
+  terminalEntries?: Array<{
+    command: string;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    cwd?: string;
+  }>;
+}): Promise<{ uri: string; mimeType: string; text: string }> {
+  const res = await fetch('/api/mcp/resources/read', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  const data = (await res.json()) as {
+    resource?: { uri: string; mimeType: string; text: string };
+    error?: string;
+  };
+  if (!res.ok || !data.resource) {
+    throw new Error(data.error ?? 'Failed to read MCP resource');
+  }
+  return data.resource;
+}
+
+export async function resolveMcpPromptTemplate(params: {
+  serverId: string;
+  name: string;
+  args?: Record<string, string>;
+  workspaceId?: string;
+}): Promise<{
+  promptText: string;
+  recommendedResources: Array<{ serverId: string; uri: string; label: string }>;
+}> {
+  const res = await fetch('/api/mcp/prompts/resolve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  const data = (await res.json()) as {
+    promptText?: string;
+    recommendedResources?: Array<{ serverId: string; uri: string; label: string }>;
+    error?: string;
+  };
+  if (!res.ok) {
+    throw new Error(data.error ?? 'Failed to resolve MCP prompt');
+  }
+  return {
+    promptText: data.promptText ?? '',
+    recommendedResources: Array.isArray(data.recommendedResources) ? data.recommendedResources : [],
+  };
+}
 
 interface TauriInternals {
   invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -631,6 +846,9 @@ export async function runAgentPlan(params: {
   agentMode: AgentMode;
   autopilot?: boolean;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  providerSettings?: AiProviderSettings;
+  pinnedContext?: PinnedContextItem[];
+  terminalEntries?: TerminalEntry[];
   signal?: AbortSignal;
   onEvent?: (event: AgentStreamEvent) => void;
 }): Promise<{
@@ -652,6 +870,9 @@ export async function runAgentPlan(params: {
     agentMode,
     autopilot,
     history,
+    providerSettings,
+    pinnedContext,
+    terminalEntries,
     signal,
     onEvent,
   } = params;
@@ -770,6 +991,15 @@ export async function runAgentPlan(params: {
         agentMode,
         autopilot: Boolean(autopilot),
         history,
+        providerSettings: providerSettings ?? loadAiProviderSettings(),
+        pinnedContext,
+        terminalEntries: (terminalEntries ?? []).slice(-6).map((t) => ({
+          command: t.command,
+          stdout: t.stdout,
+          stderr: t.stderr,
+          exitCode: t.exitCode,
+          cwd: t.cwd,
+        })),
       }),
     });
 
@@ -973,7 +1203,8 @@ export async function createTauriWorkspaceFolder(
 }
 
 export async function sendHomeChat(
-  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+  providerSettings?: AiProviderSettings
 ): Promise<{
   reply: string;
   createdProjects: CreatedProjectSummary[];
@@ -997,7 +1228,10 @@ export async function sendHomeChat(
   const res = await fetch('/api/agent/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify({
+      messages,
+      providerSettings: providerSettings ?? loadAiProviderSettings(),
+    }),
   });
   const data = (await res.json()) as {
     reply?: string;
@@ -1318,13 +1552,22 @@ export async function syncGitRemote(
   );
 }
 
-export async function generateGitCommitMessage(ctx: ActiveWorkspaceContext): Promise<string> {
+export async function generateGitCommitMessage(
+  ctx: ActiveWorkspaceContext,
+  providerSettings?: AiProviderSettings
+): Promise<string> {
   if (ctx.source === 'tauri-native' && ctx.nativeRoot) {
     return tauriInvoke<string>('git_generate_commit_message', { root: ctx.nativeRoot });
   }
   const res = await gitApiRequest<{ message?: string }>(
     `/api/workspaces/${encodeURIComponent(ctx.id)}/git/commit-message`,
-    { method: 'POST' }
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerSettings: providerSettings ?? loadAiProviderSettings(),
+      }),
+    }
   );
   return res.message ?? '';
 }

@@ -12,12 +12,26 @@ import {
   type FunctionDeclaration,
   type Part,
 } from '@google/genai';
+import {
+  McpHostManager,
+  mcpToolToGeminiDeclaration,
+  mcpToolToOpenAiSchema,
+  type McpTransportType,
+  type McpWorkspaceContext,
+} from './server/mcpHost.ts';
+import {
+  fetchOpenAiCompatModels,
+  generateSimpleOpenAiCompletion,
+  runOpenAiCompatAgentLoop,
+  type OpenAiToolDefinition,
+} from './server/openaiCompat.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 const WORKSPACES_ROOT = '/tmp/aetheris-workspaces';
+const mcpHost = new McpHostManager();
 
 interface StarterTemplate {
   id: string;
@@ -696,6 +710,225 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '24mb' }));
 
+  interface ClientProviderSettings {
+    provider?: 'gemini' | 'openai-compatible';
+    geminiModel?: string;
+    openaiBaseUrl?: string;
+    openaiModel?: string;
+    enableWebSearch?: boolean;
+  }
+
+  app.get('/api/ai/status', (_req, res) => {
+    const geminiKey = (process.env.GEMINI_API_KEY ?? '').trim();
+    const openaiKey = (
+      process.env.OPENAI_COMPAT_API_KEY ||
+      process.env.OPENAI_API_KEY ||
+      ''
+    ).trim();
+    res.json({
+      geminiConfigured: Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY'),
+      openaiCompatConfigured: Boolean(openaiKey && openaiKey !== 'MY_OPENAI_COMPAT_API_KEY'),
+      defaultOpenaiBaseUrl:
+        process.env.OPENAI_COMPAT_BASE_URL?.trim() || 'https://api.openai.com/v1',
+      defaultOpenaiModel: process.env.OPENAI_COMPAT_MODEL?.trim() || 'gpt-4o',
+      mcpEndpointPath: '/api/mcp',
+    });
+  });
+
+  app.post('/api/ai/models', async (req, res) => {
+    try {
+      const { baseUrl } = req.body as { baseUrl?: string };
+      const models = await fetchOpenAiCompatModels(baseUrl);
+      res.json({ models });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to fetch models from endpoint',
+      });
+    }
+  });
+
+  app.post('/api/ai/test', async (req, res) => {
+    const started = Date.now();
+    try {
+      const { providerSettings } = req.body as { providerSettings?: ClientProviderSettings };
+      const provider = providerSettings?.provider ?? 'gemini';
+      if (provider === 'openai-compatible') {
+        const reply = await generateSimpleOpenAiCompletion({
+          baseUrl: providerSettings?.openaiBaseUrl,
+          model: providerSettings?.openaiModel,
+          prompt: 'Respond with the single word: Connected',
+        });
+        res.json({
+          ok: true,
+          latencyMs: Date.now() - started,
+          replyPreview: reply.slice(0, 120) || 'Connected',
+        });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const model = providerSettings?.geminiModel?.trim() || 'gemini-4-hydrogen';
+      const response = await ai.models.generateContent({
+        model,
+        contents: 'Respond with the single word: Connected',
+        config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } },
+      });
+      res.json({
+        ok: true,
+        latencyMs: Date.now() - started,
+        replyPreview: (response.text ?? 'Connected').trim().slice(0, 120),
+      });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Provider connection check failed',
+      });
+    }
+  });
+
+  app.get('/api/mcp/servers', async (_req, res) => {
+    try {
+      const servers = await mcpHost.listSnapshots();
+      res.json({ servers });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list MCP servers' });
+    }
+  });
+
+  app.post('/api/mcp/servers', async (req, res) => {
+    try {
+      const { id, name, transport, enabled, description, command, args, url } = req.body as {
+        id?: string;
+        name?: string;
+        transport?: McpTransportType;
+        enabled?: boolean;
+        description?: string;
+        command?: string;
+        args?: string[];
+        url?: string;
+      };
+      if (!name?.trim() || !transport) {
+        res.status(400).json({ error: 'Server name and transport are required.' });
+        return;
+      }
+      const servers = await mcpHost.upsertServer({
+        id,
+        name,
+        transport,
+        enabled,
+        description,
+        command,
+        args,
+        url,
+      });
+      res.json({ servers });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to save MCP server' });
+    }
+  });
+
+  app.patch('/api/mcp/servers/:id', async (req, res) => {
+    try {
+      const { enabled } = req.body as { enabled?: boolean };
+      const servers = await mcpHost.setServerEnabled(req.params.id, Boolean(enabled));
+      res.json({ servers });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update MCP server' });
+    }
+  });
+
+  app.delete('/api/mcp/servers/:id', async (req, res) => {
+    try {
+      const servers = await mcpHost.removeServer(req.params.id);
+      res.json({ servers });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to remove MCP server' });
+    }
+  });
+
+  app.post('/api/mcp/resources/read', async (req, res) => {
+    try {
+      const { serverId, uri, workspaceId, activeFile, openBuffers, terminalEntries } = req.body as {
+        serverId: string;
+        uri: string;
+        workspaceId?: string;
+        activeFile?: string | null;
+        openBuffers?: Record<string, string>;
+        terminalEntries?: Array<{
+          command: string;
+          stdout: string;
+          stderr: string;
+          exitCode: number;
+          cwd?: string;
+        }>;
+      };
+      const workspaceRoot = workspaceId ? resolveSafeWorkspacePath(workspaceId).root : undefined;
+      const resource = await mcpHost.readResource(serverId, uri, {
+        workspaceRoot,
+        workspaceName: workspaceId,
+        activeFile,
+        openBuffers,
+        terminalEntries,
+      });
+      res.json({ resource });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to read MCP resource' });
+    }
+  });
+
+  app.post('/api/mcp/prompts/resolve', async (req, res) => {
+    try {
+      const { serverId, name, args, workspaceId } = req.body as {
+        serverId: string;
+        name: string;
+        args?: Record<string, string>;
+        workspaceId?: string;
+      };
+      const workspaceRoot = workspaceId ? resolveSafeWorkspacePath(workspaceId).root : undefined;
+      const resolved = await mcpHost.resolvePromptTemplate(
+        serverId,
+        name,
+        args ?? {},
+        { workspaceRoot, workspaceName: workspaceId }
+      );
+      res.json(resolved);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to resolve MCP prompt' });
+    }
+  });
+
+  app.post('/api/mcp', async (req, res) => {
+    try {
+      const workspaceIdHeader =
+        typeof req.query.workspace === 'string' && req.query.workspace.trim()
+          ? req.query.workspace.trim()
+          : STARTER_TEMPLATES[0].id;
+      let defaultRoot: string | undefined;
+      try {
+        defaultRoot = resolveSafeWorkspacePath(workspaceIdHeader).root;
+      } catch {
+        defaultRoot = undefined;
+      }
+      const rpcOut = await mcpHost.handleJsonRpcEndpoint(req.body ?? {}, {
+        workspaceRoot: defaultRoot,
+        workspaceName: workspaceIdHeader,
+      });
+      if (rpcOut === null) {
+        res.status(202).end();
+        return;
+      }
+      res.json(rpcOut);
+    } catch (err) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        id: req.body?.id ?? null,
+        error: {
+          code: -32603,
+          message: err instanceof Error ? err.message : 'Internal MCP error',
+        },
+      });
+    }
+  });
+
   app.get('/api/workspaces', async (_req, res) => {
     try {
       const entries = await fs.readdir(WORKSPACES_ROOT, { withFileTypes: true });
@@ -1055,6 +1288,9 @@ async function startServer() {
         agentMode,
         autopilot,
         history,
+        providerSettings,
+        pinnedContext,
+        terminalEntries,
       } = req.body as {
         workspaceId?: string;
         prompt: string;
@@ -1065,6 +1301,22 @@ async function startServer() {
         agentMode?: 'plan' | 'action';
         autopilot?: boolean;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+        providerSettings?: ClientProviderSettings;
+        pinnedContext?: Array<{
+          id: string;
+          kind: 'file' | 'mcp-resource';
+          label: string;
+          path?: string;
+          serverId?: string;
+          uri?: string;
+        }>;
+        terminalEntries?: Array<{
+          command: string;
+          stdout: string;
+          stderr: string;
+          exitCode: number;
+          cwd?: string;
+        }>;
       };
 
       if (!prompt || !prompt.trim()) {
@@ -1079,13 +1331,22 @@ async function startServer() {
 
       const startedAt = Date.now();
       const isPlanMode = agentMode === 'plan';
-      const ai = getGeminiClient();
+      const activeProvider = providerSettings?.provider ?? 'gemini';
+      const webSearchEnabled = providerSettings?.enableWebSearch !== false;
       const bufferMap = new Map<string, string>(Object.entries(openBuffers ?? {}));
       const virtualMap = new Map<string, string>(
         (files ?? []).map((f) => [f.path, f.content])
       );
       const useDisk = Boolean(workspaceId);
       const workspaceRoot = workspaceId ? resolveSafeWorkspacePath(workspaceId).root : '';
+      const mcpCtx: McpWorkspaceContext = {
+        workspaceRoot: workspaceRoot || undefined,
+        workspaceName: workspaceId,
+        activeFile,
+        openBuffers,
+        virtualFiles: virtualMap,
+        terminalEntries,
+      };
 
       const listAllRelPaths = async (): Promise<string[]> => {
         if (!useDisk) {
@@ -1270,20 +1531,132 @@ async function startServer() {
         },
       };
 
+      const enabledMcpTools = await mcpHost.getEnabledTools();
+      const mcpGeminiDecls = enabledMcpTools.map((t) => mcpToolToGeminiDeclaration(t));
+      const mcpOpenAiTools = enabledMcpTools.map((t) => mcpToolToOpenAiSchema(t));
+
       const declarations: FunctionDeclaration[] = isPlanMode
-        ? [listToolDecl, readToolDecl, searchToolDecl]
+        ? [listToolDecl, readToolDecl, searchToolDecl, ...mcpGeminiDecls]
         : [
             listToolDecl,
             readToolDecl,
             searchToolDecl,
-            propose_edit_alias(editToolDecl),
+            editToolDecl,
             createToolDecl,
             deleteToolDecl,
+            ...mcpGeminiDecls,
           ];
 
-      function propose_edit_alias(d: FunctionDeclaration): FunctionDeclaration {
-        return d;
-      }
+      const openAiWorkspaceTools: OpenAiToolDefinition[] = [
+        {
+          type: 'function',
+          function: {
+            name: 'list_workspace_files',
+            description: listToolDecl.description ?? '',
+            parameters: {
+              type: 'object',
+              properties: {
+                directory: { type: 'string', description: 'Optional relative directory prefix.' },
+                filter: { type: 'string', description: 'Optional case-insensitive path substring filter.' },
+              },
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            description: readToolDecl.description ?? '',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Relative file path inside workspace.' },
+                start_line: { type: 'integer', description: '1-based start line (default 1).' },
+                end_line: { type: 'integer', description: '1-based inclusive end line.' },
+              },
+              required: ['path'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'search_workspace',
+            description: searchToolDecl.description ?? '',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'Text or symbol substring to search for.' },
+                case_sensitive: { type: 'boolean', description: 'Match exact case if true.' },
+              },
+              required: ['query'],
+            },
+          },
+        },
+        ...(isPlanMode
+          ? []
+          : ([
+              {
+                type: 'function',
+                function: {
+                  name: 'propose_edit',
+                  description: editToolDecl.description ?? '',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      path: { type: 'string', description: 'Relative path of existing file to modify.' },
+                      rationale: { type: 'string', description: 'Concise reason for this edit.' },
+                      edits: {
+                        type: 'array',
+                        description: 'Ordered list of exact search-and-replace hunks.',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            old_text: { type: 'string', description: 'Exact existing lines to replace.' },
+                            new_text: { type: 'string', description: 'Replacement code.' },
+                          },
+                          required: ['old_text', 'new_text'],
+                        },
+                      },
+                    },
+                    required: ['path', 'rationale', 'edits'],
+                  },
+                },
+              },
+              {
+                type: 'function',
+                function: {
+                  name: 'propose_create_file',
+                  description: createToolDecl.description ?? '',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      path: { type: 'string', description: 'Relative path for the new file.' },
+                      rationale: { type: 'string', description: 'Why this file is being created.' },
+                      content: { type: 'string', description: 'Complete contents of the new file.' },
+                    },
+                    required: ['path', 'rationale', 'content'],
+                  },
+                },
+              },
+              {
+                type: 'function',
+                function: {
+                  name: 'propose_delete_file',
+                  description: deleteToolDecl.description ?? '',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      path: { type: 'string', description: 'Relative path of file to delete.' },
+                      rationale: { type: 'string', description: 'Why this file should be removed.' },
+                    },
+                    required: ['path', 'rationale'],
+                  },
+                },
+              },
+            ] as OpenAiToolDefinition[])),
+        ...mcpOpenAiTools,
+      ];
 
       const executeTool = async (
         name: string,
@@ -1551,12 +1924,79 @@ async function startServer() {
           return { ok: true, path: relPath };
         }
 
+        if (name.startsWith('mcp__')) {
+          emitEvent({
+            type: 'activity',
+            activity: {
+              id: actId,
+              kind: 'read',
+              label: `MCP Tool: ${name.replace(/^mcp__[^_]+__/, '')}`,
+              status: 'running',
+            },
+          });
+          const mcpResult = await mcpHost.callToolByQualifiedName(name, args, mcpCtx);
+          if (mcpResult) {
+            emitEvent({
+              type: 'activity',
+              activity: {
+                id: actId,
+                kind: 'read',
+                label: `MCP [${mcpResult.serverName}]: ${mcpResult.toolName}`,
+                status: 'done',
+              },
+            });
+            stepTrace.push(`Executed MCP tool ${mcpResult.toolName} on ${mcpResult.serverName}`);
+            return mcpResult.output;
+          }
+        }
+
         return { error: `Unknown or disallowed tool: ${name}` };
       };
 
       const allPaths = await listAllRelPaths();
       const previewTreeList = allPaths.slice(0, 120).join('\n');
       const activePreview = activeFile ? await readRawFile(activeFile) : null;
+
+      // Resolve pinned files & MCP resources attached from the IDE composer
+      const pinnedBlocks: string[] = [];
+      for (const item of pinnedContext ?? []) {
+        if (item.kind === 'file' && item.path) {
+          const content = await readRawFile(item.path);
+          if (content !== null) {
+            emitEvent({
+              type: 'activity',
+              activity: {
+                id: `pin-file-${item.id}`,
+                kind: 'read',
+                label: `Context File: ${item.path}`,
+                filePath: item.path,
+                status: 'done',
+              },
+            });
+            pinnedBlocks.push(
+              `<pinned_file path="${item.path}">\n${content.slice(0, 14_000)}\n</pinned_file>`
+            );
+          }
+        } else if (item.kind === 'mcp-resource' && item.serverId && item.uri) {
+          try {
+            const resourceData = await mcpHost.readResource(item.serverId, item.uri, mcpCtx);
+            emitEvent({
+              type: 'activity',
+              activity: {
+                id: `pin-mcp-${item.id}`,
+                kind: 'read',
+                label: `MCP Context: ${item.label}`,
+                status: 'done',
+              },
+            });
+            pinnedBlocks.push(
+              `<mcp_resource server="${item.serverId}" uri="${item.uri}" name="${item.label}">\n${resourceData.text.slice(0, 14_000)}\n</mcp_resource>`
+            );
+          } catch {
+            // Skip unreadable MCP resource
+          }
+        }
+      }
 
       emitEvent({
         type: 'activity',
@@ -1585,29 +2025,27 @@ async function startServer() {
           ? ' AUTOPILOT IS ENABLED: Execute the user request completely end-to-end without pausing to ask for permission or confirmation; stage every required edit, creation, and deletion in this run so they can be applied automatically.'
           : '';
 
-      const systemInstruction = isPlanMode
-        ? 'You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace) AND live Google Search grounding. Always inspect all relevant workspace files before planning, and use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.'
-        : `You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file) AND live Google Search grounding. ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use Google Search whenever you need up-to-date documentation, APIs, package versions, or web information. Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).${autopilotClause}`;
+      const searchGuidance = webSearchEnabled
+        ? activeProvider === 'openai-compatible'
+          ? 'You also have live web search tools (`web_search` and `fetch_web_page`) AND Model Context Protocol (`mcp__*`) tools — call `web_search` whenever you need current library docs, APIs, package versions, or web facts.'
+          : 'You also have live Google Search grounding AND Model Context Protocol (`mcp__*`) tools — use Google Search whenever you need up-to-date library docs, package versions, APIs, or web facts.'
+        : 'You also have Model Context Protocol (`mcp__*`) tools for live Git status/diffs and workspace symbol indexing.';
 
-      const priorTurns: Content[] = (history ?? [])
-        .filter((h) => h.content && h.content.trim())
-        .slice(-10)
-        .map((h) => ({
-          role: h.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: h.content.slice(0, 4000) }],
-        }));
+      const systemInstruction = isPlanMode
+        ? `You are Aetheris in PLAN MODE (read-only). You have full workspace tools (list_workspace_files, read_file with line ranges, search_workspace). ${searchGuidance} Always inspect all relevant workspace files before planning. Never guess file contents. Respond in clean Markdown prose with headings and numbered steps citing exact file paths and symbols—never wrap your whole explanation inside a fenced code block.`
+        : `You are Aetheris in ACTION MODE (autonomous multi-file coding agent). You have full workspace tools (list_workspace_files, read_file, search_workspace, propose_edit, propose_create_file, propose_delete_file). ${searchGuidance} ALWAYS read files via read_file before editing them (read large files in line slices if needed). Use propose_edit with exact verbatim old_text hunks instead of rewriting whole large files. Respond in clean Markdown prose (never wrap your whole response inside a fenced code block—use fenced code blocks only for short code snippets).${autopilotClause}`;
 
       const activeSnippet =
         activePreview !== null
           ? `\nActive editor file (${activeFile}, ${activePreview.split(/\r?\n/).length} lines) — use read_file for full or other files.`
           : '';
 
-      const initialPrompt = `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (tool-based edits)'}\nActive editor file: ${activeFile ?? 'none'}${activeSnippet}\nTotal workspace files: ${allPaths.length}\nFiles overview (call list_workspace_files for full list if needed):\n${previewTreeList}\n\nUser request:\n${prompt}`;
+      const pinnedSection =
+        pinnedBlocks.length > 0
+          ? `\n\nAttached Context & MCP Resources:\n${pinnedBlocks.join('\n\n')}`
+          : '';
 
-      const contents: Content[] = [
-        ...priorTurns,
-        { role: 'user', parts: [{ text: initialPrompt }] },
-      ];
+      const initialPrompt = `Mode: ${isPlanMode ? 'PLAN (read-only)' : 'ACTION (tool-based edits)'}\nActive editor file: ${activeFile ?? 'none'}${activeSnippet}\nTotal workspace files: ${allPaths.length}\nFiles overview (call list_workspace_files for full list if needed):\n${previewTreeList}${pinnedSection}\n\nUser request:\n${prompt}`;
 
       let finalAnswerText = '';
       let thoughtsAccum = '';
@@ -1617,146 +2055,192 @@ async function startServer() {
       const searchQueriesSet = new Set<string>();
       const emittedSearchQueries = new Set<string>();
 
-      for (let turn = 0; turn < maxTurns; turn++) {
-        if (clientClosed || abortController.signal.aborted) break;
+      if (activeProvider === 'openai-compatible') {
+        const cleanHistory = (history ?? [])
+          .filter((h) => h.content && h.content.trim())
+          .slice(-10);
 
-        const stream = await ai.models.generateContentStream({
-          model: 'gemini-4-hydrogen',
-          contents,
-          config: {
-            abortSignal: abortController.signal,
-            systemInstruction,
-            thinkingConfig: {
-              thinkingLevel,
-              includeThoughts: true,
-            },
-            tools: [
-              { googleSearch: {} },
-              { functionDeclarations: declarations },
-            ],
-            toolConfig: { includeServerSideToolInvocations: true },
-          },
+        const oaOut = await runOpenAiCompatAgentLoop({
+          baseUrl: providerSettings?.openaiBaseUrl,
+          model: providerSettings?.openaiModel,
+          systemInstruction,
+          history: cleanHistory,
+          initialUserPrompt: initialPrompt,
+          tools: openAiWorkspaceTools,
+          enableWebSearch: webSearchEnabled,
+          maxTurns,
+          signal: abortController.signal,
+          executeCustomTool: executeTool,
+          onActivity: (activity) => emitEvent({ type: 'activity', activity }),
+          onThoughtDelta: (delta) => emitEvent({ type: 'thought', delta }),
         });
 
-        const modelParts: Part[] = [];
-        const functionCalls: Array<{ id?: string; name: string; args: Record<string, unknown> }> = [];
-        let turnText = '';
+        finalAnswerText = oaOut.finalText;
+        thoughtsAccum = oaOut.thoughts;
+        thoughtStartMs = startedAt;
+        thoughtEndMs = startedAt + oaOut.thinkingDurationMs;
+        for (const src of oaOut.sources) {
+          groundingSourcesMap.set(src.uri, src);
+        }
+        for (const q of oaOut.searchQueries) {
+          searchQueriesSet.add(q);
+        }
+      } else {
+        const ai = getGeminiClient();
+        const geminiModel = providerSettings?.geminiModel?.trim() || 'gemini-4-hydrogen';
+        const priorTurns: Content[] = (history ?? [])
+          .filter((h) => h.content && h.content.trim())
+          .slice(-10)
+          .map((h) => ({
+            role: h.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: h.content.slice(0, 4000) }],
+          }));
 
-        for await (const chunk of stream) {
+        const contents: Content[] = [
+          ...priorTurns,
+          { role: 'user', parts: [{ text: initialPrompt }] },
+        ];
+
+        for (let turn = 0; turn < maxTurns; turn++) {
           if (clientClosed || abortController.signal.aborted) break;
 
-          const gm = chunk.candidates?.[0]?.groundingMetadata;
-          if (gm) {
-            if (Array.isArray(gm.webSearchQueries)) {
-              for (const q of gm.webSearchQueries) {
-                const trimmedQ = typeof q === 'string' ? q.trim() : '';
-                if (!trimmedQ) continue;
-                searchQueriesSet.add(trimmedQ);
-                if (!emittedSearchQueries.has(trimmedQ)) {
-                  emittedSearchQueries.add(trimmedQ);
-                  emitEvent({
-                    type: 'activity',
-                    activity: {
-                      id: `gsearch-${turn}-${emittedSearchQueries.size}`,
-                      kind: 'search',
-                      label: `Google Search: "${trimmedQ.slice(0, 48)}"`,
-                      status: 'done',
-                    },
-                  });
-                }
-              }
-            }
-            if (Array.isArray(gm.groundingChunks)) {
-              for (const gChunk of gm.groundingChunks) {
-                const uri = gChunk.web?.uri?.trim();
-                if (!uri) continue;
-                const title = gChunk.web?.title?.trim() || uri;
-                if (!groundingSourcesMap.has(uri)) {
-                  groundingSourcesMap.set(uri, { title, uri });
-                }
-              }
-            }
-          }
-
-          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
-          for (const part of parts) {
-            const pAny = part as Part & {
-              thought?: boolean;
-              thoughtSignature?: string;
-              toolCall?: { id?: string; toolType?: string; args?: Record<string, unknown> };
-              toolResponse?: unknown;
-            };
-            const textPiece = typeof pAny.text === 'string' ? pAny.text : '';
-
-            if (pAny.thought) {
-              if (textPiece) {
-                if (thoughtStartMs === null) thoughtStartMs = Date.now();
-                thoughtEndMs = Date.now();
-                thoughtsAccum += textPiece;
-                emitEvent({ type: 'thought', delta: textPiece });
-              }
-              continue;
-            }
-
-            if (pAny.functionCall) {
-              modelParts.push(part);
-              functionCalls.push({
-                id: pAny.functionCall.id,
-                name: pAny.functionCall.name ?? '',
-                args: (pAny.functionCall.args as Record<string, unknown>) ?? {},
-              });
-            } else if (pAny.toolCall || pAny.toolResponse) {
-              // Preserve server-side tool invocation & response parts for multi-turn hybrid grounding
-              modelParts.push(part);
-            } else if (textPiece || pAny.thoughtSignature) {
-              if (textPiece) turnText += textPiece;
-              const last = modelParts[modelParts.length - 1] as
-                | (Part & { thoughtSignature?: string })
-                | undefined;
-              if (
-                last &&
-                typeof last.text === 'string' &&
-                !last.functionCall &&
-                !last.toolCall &&
-                !last.toolResponse &&
-                !last.thoughtSignature &&
-                !pAny.thoughtSignature
-              ) {
-                last.text += textPiece;
-              } else {
-                modelParts.push({ ...part });
-              }
-            } else {
-              modelParts.push(part);
-            }
-          }
-        }
-
-        if (clientClosed || abortController.signal.aborted) break;
-
-        if (modelParts.length > 0) {
-          contents.push({ role: 'model', parts: modelParts });
-        }
-
-        if (functionCalls.length === 0) {
-          finalAnswerText = turnText.trim();
-          break;
-        }
-
-        const responseParts: Part[] = [];
-        for (let i = 0; i < functionCalls.length; i++) {
-          const fc = functionCalls[i];
-          const toolOut = await executeTool(fc.name, fc.args, i + turn * 20);
-          responseParts.push({
-            functionResponse: {
-              id: fc.id,
-              name: fc.name,
-              response: toolOut,
+          const stream = await ai.models.generateContentStream({
+            model: geminiModel,
+            contents,
+            config: {
+              abortSignal: abortController.signal,
+              systemInstruction,
+              thinkingConfig: {
+                thinkingLevel,
+                includeThoughts: true,
+              },
+              tools: [
+                ...(webSearchEnabled ? [{ googleSearch: {} }] : []),
+                { functionDeclarations: declarations },
+              ],
+              ...(webSearchEnabled ? { toolConfig: { includeServerSideToolInvocations: true } } : {}),
             },
           });
-        }
 
-        contents.push({ role: 'user', parts: responseParts });
+          const modelParts: Part[] = [];
+          const functionCalls: Array<{ id?: string; name: string; args: Record<string, unknown> }> = [];
+          let turnText = '';
+
+          for await (const chunk of stream) {
+            if (clientClosed || abortController.signal.aborted) break;
+
+            const gm = chunk.candidates?.[0]?.groundingMetadata;
+            if (gm) {
+              if (Array.isArray(gm.webSearchQueries)) {
+                for (const q of gm.webSearchQueries) {
+                  const trimmedQ = typeof q === 'string' ? q.trim() : '';
+                  if (!trimmedQ) continue;
+                  searchQueriesSet.add(trimmedQ);
+                  if (!emittedSearchQueries.has(trimmedQ)) {
+                    emittedSearchQueries.add(trimmedQ);
+                    emitEvent({
+                      type: 'activity',
+                      activity: {
+                        id: `gsearch-${turn}-${emittedSearchQueries.size}`,
+                        kind: 'search',
+                        label: `Google Search: "${trimmedQ.slice(0, 48)}"`,
+                        status: 'done',
+                      },
+                    });
+                  }
+                }
+              }
+              if (Array.isArray(gm.groundingChunks)) {
+                for (const gChunk of gm.groundingChunks) {
+                  const uri = gChunk.web?.uri?.trim();
+                  if (!uri) continue;
+                  const title = gChunk.web?.title?.trim() || uri;
+                  if (!groundingSourcesMap.has(uri)) {
+                    groundingSourcesMap.set(uri, { title, uri });
+                  }
+                }
+              }
+            }
+
+            const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+            for (const part of parts) {
+              const pAny = part as Part & {
+                thought?: boolean;
+                thoughtSignature?: string;
+                toolCall?: { id?: string; toolType?: string; args?: Record<string, unknown> };
+                toolResponse?: unknown;
+              };
+              const textPiece = typeof pAny.text === 'string' ? pAny.text : '';
+
+              if (pAny.thought) {
+                if (textPiece) {
+                  if (thoughtStartMs === null) thoughtStartMs = Date.now();
+                  thoughtEndMs = Date.now();
+                  thoughtsAccum += textPiece;
+                  emitEvent({ type: 'thought', delta: textPiece });
+                }
+                continue;
+              }
+
+              if (pAny.functionCall) {
+                modelParts.push(part);
+                functionCalls.push({
+                  id: pAny.functionCall.id,
+                  name: pAny.functionCall.name ?? '',
+                  args: (pAny.functionCall.args as Record<string, unknown>) ?? {},
+                });
+              } else if (pAny.toolCall || pAny.toolResponse) {
+                modelParts.push(part);
+              } else if (textPiece || pAny.thoughtSignature) {
+                if (textPiece) turnText += textPiece;
+                const last = modelParts[modelParts.length - 1] as
+                  | (Part & { thoughtSignature?: string })
+                  | undefined;
+                if (
+                  last &&
+                  typeof last.text === 'string' &&
+                  !last.functionCall &&
+                  !last.toolCall &&
+                  !last.toolResponse &&
+                  !last.thoughtSignature &&
+                  !pAny.thoughtSignature
+                ) {
+                  last.text += textPiece;
+                } else {
+                  modelParts.push({ ...part });
+                }
+              } else {
+                modelParts.push(part);
+              }
+            }
+          }
+
+          if (clientClosed || abortController.signal.aborted) break;
+
+          if (modelParts.length > 0) {
+            contents.push({ role: 'model', parts: modelParts });
+          }
+
+          if (functionCalls.length === 0) {
+            finalAnswerText = turnText.trim();
+            break;
+          }
+
+          const responseParts: Part[] = [];
+          for (let i = 0; i < functionCalls.length; i++) {
+            const fc = functionCalls[i];
+            const toolOut = await executeTool(fc.name, fc.args, i + turn * 20);
+            responseParts.push({
+              functionResponse: {
+                id: fc.id,
+                name: fc.name,
+                response: toolOut,
+              },
+            });
+          }
+
+          contents.push({ role: 'user', parts: responseParts });
+        }
       }
 
       if (clientClosed || abortController.signal.aborted) {
@@ -1824,8 +2308,9 @@ async function startServer() {
 
   app.post('/api/agent/chat', async (req, res) => {
     try {
-      const { messages } = req.body as {
+      const { messages, providerSettings } = req.body as {
         messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+        providerSettings?: ClientProviderSettings;
       };
       const cleaned = (messages ?? []).filter((m) => m.content && m.content.trim());
       if (cleaned.length === 0) {
@@ -1833,7 +2318,9 @@ async function startServer() {
         return;
       }
 
-      const ai = getGeminiClient();
+      const activeProvider = providerSettings?.provider ?? 'gemini';
+      const webSearchEnabled = providerSettings?.enableWebSearch !== false;
+
       const createdProjectsMap = new Map<
         string,
         { id: string; name: string; description: string; language: string }
@@ -2013,81 +2500,188 @@ async function startServer() {
             return { ok: true, project: slug, file: rel };
           }
 
+          if (name.startsWith('mcp__')) {
+            const mcpRes = await mcpHost.callToolByQualifiedName(name, args, {});
+            if (mcpRes) return mcpRes.output;
+          }
+
           return { error: `Unknown tool: ${name}` };
         } catch (err) {
           return { error: err instanceof Error ? err.message : 'Tool failed' };
         }
       };
 
-      const contents: Content[] = cleaned.slice(-16).map((m) => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      }));
+      const quickChatSystem =
+        'You are Aetheris Quick Chat on the Home Screen. You help users brainstorm, look up current technical information via web search, or start new projects. PERMISSIONS: You have CREATE-ONLY workspace permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list. Use web search whenever up-to-date web facts, documentation, or current information are needed.';
 
       let replyText = '';
       const groundingSourcesMap = new Map<string, { title: string; uri: string }>();
       const searchQueriesSet = new Set<string>();
 
-      for (let turn = 0; turn < 8; turn++) {
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents,
-          config: {
-            systemInstruction:
-              'You are Aetheris Quick Chat on the Home Screen. You help users brainstorm, look up current technical information via Google Search, or start new projects. PERMISSIONS: You have CREATE-ONLY workspace permissions via create_project, create_folder, and create_file. You MUST NEVER edit, overwrite, or delete existing files (if the user asks to modify an existing file or project, explain that Quick Chat is create-only and they should open the project in the IDE editor to edit files). Whenever the user asks to create a new project, call create_project (or create_folder/create_file) immediately—the created project is automatically added to the Home screen list. Use Google Search grounding whenever up-to-date web facts, documentation, or current information are needed.',
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            tools: [
-              { googleSearch: {} },
-              { functionDeclarations: [createProjectDecl, createFolderDecl, createFileDecl] },
-            ],
-            toolConfig: { includeServerSideToolInvocations: true },
+      if (activeProvider === 'openai-compatible') {
+        const externalMcpTools = (await mcpHost.getEnabledTools())
+          .filter((t) => t.serverId !== 'builtin-workspace')
+          .map((t) => mcpToolToOpenAiSchema(t));
+
+        const quickOpenAiTools: OpenAiToolDefinition[] = [
+          {
+            type: 'function',
+            function: {
+              name: 'create_project',
+              description: createProjectDecl.description ?? '',
+              parameters: {
+                type: 'object',
+                properties: {
+                  project_name: { type: 'string' },
+                  description: { type: 'string' },
+                  language: { type: 'string' },
+                  folders: { type: 'array', items: { type: 'string' } },
+                  files: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        path: { type: 'string' },
+                        content: { type: 'string' },
+                      },
+                      required: ['path', 'content'],
+                    },
+                  },
+                },
+                required: ['project_name', 'description', 'language', 'files'],
+              },
+            },
           },
+          {
+            type: 'function',
+            function: {
+              name: 'create_folder',
+              description: createFolderDecl.description ?? '',
+              parameters: {
+                type: 'object',
+                properties: {
+                  project_name: { type: 'string' },
+                  folder_path: { type: 'string' },
+                },
+                required: ['project_name', 'folder_path'],
+              },
+            },
+          },
+          {
+            type: 'function',
+            function: {
+              name: 'create_file',
+              description: createFileDecl.description ?? '',
+              parameters: {
+                type: 'object',
+                properties: {
+                  project_name: { type: 'string' },
+                  file_path: { type: 'string' },
+                  content: { type: 'string' },
+                },
+                required: ['project_name', 'file_path', 'content'],
+              },
+            },
+          },
+          ...externalMcpTools,
+        ];
+
+        const lastMsg = cleaned[cleaned.length - 1];
+        const prior = cleaned.slice(-16, -1);
+        const oaChat = await runOpenAiCompatAgentLoop({
+          baseUrl: providerSettings?.openaiBaseUrl,
+          model: providerSettings?.openaiModel,
+          systemInstruction: quickChatSystem,
+          history: prior,
+          initialUserPrompt: lastMsg.content,
+          tools: quickOpenAiTools,
+          enableWebSearch: webSearchEnabled,
+          maxTurns: 8,
+          executeCustomTool: (toolName, toolArgs) => runQuickChatTool(toolName, toolArgs),
         });
 
-        const gm = response.candidates?.[0]?.groundingMetadata;
-        if (gm) {
-          if (Array.isArray(gm.webSearchQueries)) {
-            for (const q of gm.webSearchQueries) {
-              if (typeof q === 'string' && q.trim()) searchQueriesSet.add(q.trim());
+        replyText = oaChat.finalText;
+        for (const s of oaChat.sources) groundingSourcesMap.set(s.uri, s);
+        for (const q of oaChat.searchQueries) searchQueriesSet.add(q);
+      } else {
+        const ai = getGeminiClient();
+        const geminiModel = providerSettings?.geminiModel?.trim() || 'gemini-4-hydrogen';
+        const externalMcpGemini = (await mcpHost.getEnabledTools())
+          .filter((t) => t.serverId !== 'builtin-workspace')
+          .map((t) => mcpToolToGeminiDeclaration(t));
+
+        const contents: Content[] = cleaned.slice(-16).map((m) => ({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: m.content }],
+        }));
+
+        for (let turn = 0; turn < 8; turn++) {
+          const response = await ai.models.generateContent({
+            model: geminiModel,
+            contents,
+            config: {
+              systemInstruction: quickChatSystem,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              tools: [
+                ...(webSearchEnabled ? [{ googleSearch: {} }] : []),
+                {
+                  functionDeclarations: [
+                    createProjectDecl,
+                    createFolderDecl,
+                    createFileDecl,
+                    ...externalMcpGemini,
+                  ],
+                },
+              ],
+              ...(webSearchEnabled ? { toolConfig: { includeServerSideToolInvocations: true } } : {}),
+            },
+          });
+
+          const gm = response.candidates?.[0]?.groundingMetadata;
+          if (gm) {
+            if (Array.isArray(gm.webSearchQueries)) {
+              for (const q of gm.webSearchQueries) {
+                if (typeof q === 'string' && q.trim()) searchQueriesSet.add(q.trim());
+              }
             }
-          }
-          if (Array.isArray(gm.groundingChunks)) {
-            for (const gChunk of gm.groundingChunks) {
-              const uri = gChunk.web?.uri?.trim();
-              if (!uri) continue;
-              const title = gChunk.web?.title?.trim() || uri;
-              if (!groundingSourcesMap.has(uri)) {
-                groundingSourcesMap.set(uri, { title, uri });
+            if (Array.isArray(gm.groundingChunks)) {
+              for (const gChunk of gm.groundingChunks) {
+                const uri = gChunk.web?.uri?.trim();
+                if (!uri) continue;
+                const title = gChunk.web?.title?.trim() || uri;
+                if (!groundingSourcesMap.has(uri)) {
+                  groundingSourcesMap.set(uri, { title, uri });
+                }
               }
             }
           }
-        }
 
-        const candidateContent = response.candidates?.[0]?.content;
-        const calls = response.functionCalls ?? [];
-        if (candidateContent) {
-          contents.push(candidateContent);
-        }
-        if (calls.length === 0) {
-          replyText = (response.text ?? '').trim();
-          break;
-        }
+          const candidateContent = response.candidates?.[0]?.content;
+          const calls = response.functionCalls ?? [];
+          if (candidateContent) {
+            contents.push(candidateContent);
+          }
+          if (calls.length === 0) {
+            replyText = (response.text ?? '').trim();
+            break;
+          }
 
-        const respParts: Part[] = [];
-        for (const call of calls) {
-          const result = await runQuickChatTool(
-            call.name ?? '',
-            (call.args as Record<string, unknown>) ?? {}
-          );
-          respParts.push({
-            functionResponse: {
-              id: call.id,
-              name: call.name ?? '',
-              response: result,
-            },
-          });
+          const respParts: Part[] = [];
+          for (const call of calls) {
+            const result = await runQuickChatTool(
+              call.name ?? '',
+              (call.args as Record<string, unknown>) ?? {}
+            );
+            respParts.push({
+              functionResponse: {
+                id: call.id,
+                name: call.name ?? '',
+                response: result,
+              },
+            });
+          }
+          contents.push({ role: 'user', parts: respParts });
         }
-        contents.push({ role: 'user', parts: respParts });
       }
 
       res.json({
@@ -2369,6 +2963,7 @@ async function startServer() {
 
   app.post('/api/workspaces/:id/git/commit-message', async (req, res) => {
     try {
+      const { providerSettings } = (req.body ?? {}) as { providerSettings?: ClientProviderSettings };
       const { root } = resolveSafeWorkspacePath(req.params.id);
       const stagedDiff = await runGit(root, ['diff', '--cached']);
       const workingDiff = stagedDiff.stdout.trim()
@@ -2381,10 +2976,22 @@ async function startServer() {
         return;
       }
 
+      const commitPrompt = `Write a single concise conventional git commit message (<= 72 chars on first line, no quotes or markdown) for these changes:\n\n${diffInput}`;
+      if (providerSettings?.provider === 'openai-compatible') {
+        const text = await generateSimpleOpenAiCompletion({
+          baseUrl: providerSettings.openaiBaseUrl,
+          model: providerSettings.openaiModel,
+          prompt: commitPrompt,
+        });
+        res.json({ message: text.replace(/^["'`]+|["'`]+$/g, '').split(/\r?\n/)[0] ?? '' });
+        return;
+      }
+
       const ai = getGeminiClient();
+      const geminiModel = providerSettings?.geminiModel?.trim() || 'gemini-4-hydrogen';
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Write a single concise conventional git commit message (<= 72 chars on first line, no quotes or markdown) for these changes:\n\n${diffInput}`,
+        model: geminiModel,
+        contents: commitPrompt,
         config: {
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },

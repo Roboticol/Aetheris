@@ -11,6 +11,7 @@ import {
   Loader2,
   MessageSquare,
   Plus,
+  Settings,
   Trash2,
   X,
 } from 'lucide-react';
@@ -36,6 +37,8 @@ interface HomeScreenProps {
   onOpenCreatedProject: (project: CreatedProjectSummary) => void;
   onSendChat: (text: string) => Promise<void>;
   onClearChat: () => void;
+  activeProviderLabel: string;
+  onOpenSettings: () => void;
 }
 
 const SMALLTALK_PROMPTS = [
@@ -57,6 +60,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onOpenCreatedProject,
   onSendChat,
   onClearChat,
+  activeProviderLabel,
+  onOpenSettings,
 }) => {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState('');
@@ -95,12 +100,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
 
   return (
     <div className="relative flex h-full w-full flex-col overflow-y-auto bg-[#0F1117] px-6 py-8">
+      <div className="mx-auto flex w-full max-w-5xl justify-end">
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          className="flex items-center gap-1.5 rounded-md border border-[#272B38] bg-[#161922] px-3 py-1.5 text-[12px] font-medium text-[#B5BBC9] hover:border-[#6366F1]/70 hover:text-[#E6E8EE] transition-colors whitespace-nowrap shrink-0"
+        >
+          <Settings className="h-3.5 w-3.5 text-[#818CF8]" />
+          <span>Settings</span>
+          <span className="font-mono text-[11px] text-[#8B92A5]">· {activeProviderLabel}</span>
+        </button>
+      </div>
+
       {/* Centered Hero: Brand + Large Digital Clock */}
       <motion.div
         initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-        className="mx-auto flex w-full max-w-5xl flex-col items-center pt-2 pb-8"
+        className="mx-auto flex w-full max-w-5xl flex-col items-center pt-1 pb-8"
       >
         <div className="flex items-center gap-3 mb-4">
           <img
@@ -307,17 +324,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         {/* Right Column: Home Companion Chat */}
         <section className="lg:col-span-6 flex h-[480px] flex-col rounded-lg border border-[#272B38] bg-[#161922]">
           <div className="flex h-11 shrink-0 items-center justify-between border-b border-[#272B38] px-4">
-            <div className="flex items-center gap-2">
-              <MessageSquare className="h-4 w-4 text-[#818CF8]" />
-              <h2 className="text-[13px] font-semibold text-[#E6E8EE]">
+            <div className="flex items-center gap-2 min-w-0">
+              <MessageSquare className="h-4 w-4 shrink-0 text-[#818CF8]" />
+              <h2 className="text-[13px] font-semibold text-[#E6E8EE] whitespace-nowrap">
                 Quick Chat
               </h2>
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                className="truncate font-mono text-[11px] text-[#8B92A5] hover:text-[#C7D2FE] transition-colors"
+                title="Switch AI Provider or MCP settings"
+              >
+                {activeProviderLabel}
+              </button>
             </div>
             {chatMessages.length > 0 && (
               <button
                 type="button"
                 onClick={onClearChat}
-                className="flex items-center gap-1 rounded px-2 py-1 text-[11.5px] text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors"
+                className="flex items-center gap-1 rounded px-2 py-1 text-[11.5px] text-[#8B92A5] hover:bg-[#1E222E] hover:text-[#E6E8EE] transition-colors whitespace-nowrap shrink-0"
               >
                 <Trash2 className="h-3 w-3" />
                 <span>Clear</span>
@@ -373,7 +398,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     <div className="rounded-md border border-[#272B38]/80 bg-[#0F1117]/70 px-2.5 py-2 space-y-1.5">
                       <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-[#8B92A5]">
                         <Globe className="h-3 w-3 text-sky-400" />
-                        <span>Google Search Sources</span>
+                        <span>Web Search Sources</span>
                       </div>
                       <div className="flex flex-wrap gap-1.5">
                         {msg.sources.map((src) => (

@@ -11,6 +11,7 @@ import {
   AgentMessage,
   AgentMode,
   AgentPatch,
+  AiProviderSettings,
   CreatedProjectSummary,
   CursorPosition,
   EditorTab,
@@ -19,7 +20,9 @@ import {
   GitFileEntry,
   GitStatusSnapshot,
   HomeChatMessage,
+  McpServerSnapshot,
   ModelEffort,
+  PinnedContextItem,
   RecentWorkspace,
   SearchHit,
   TerminalEntry,
@@ -37,12 +40,15 @@ import {
   execWorkspaceCommand,
   fetchGitFileDiff,
   fetchGitStatus,
+  fetchMcpServers,
+  fetchServerAiStatus,
   fetchWorkspaceTree,
   flattenFilePaths,
   generateGitCommitMessage,
   initGitRepository,
   isTauriRuntime,
   listStarterWorkspaces,
+  loadAiProviderSettings,
   loadLocalDirHandle,
   loadRecentWorkspaces,
   readWorkspaceFile,
@@ -50,8 +56,10 @@ import {
   removeRecentWorkspace,
   renameWorkspaceEntry,
   resetStarterWorkspace,
+  resolveMcpPromptTemplate,
   runAgentPlan,
   runGitBranchAction,
+  saveAiProviderSettings,
   saveLocalDirHandle,
   searchWorkspace,
   sendHomeChat,
@@ -75,6 +83,7 @@ import { TerminalDrawer } from './components/TerminalDrawer';
 import { AgentPanel } from './components/AgentPanel';
 import { CommandPalette } from './components/CommandPalette';
 import { HomeScreen } from './components/HomeScreen';
+import { SettingsModal } from './components/SettingsModal';
 import { Tooltip } from './components/Tooltip';
 
 const PANEL_SIZES_KEY = 'aetheris.panelSizes';
@@ -155,7 +164,13 @@ export default function App() {
   const [allSymbols, setAllSymbols] = useState<SearchHit[]>([]);
   const [isSearching, setIsSearching] = useState(false);
 
-  // Agent & Diff state
+  // Agent, AI Provider, MCP & Diff state
+  const [aiSettings, setAiSettings] = useState<AiProviderSettings>(() => loadAiProviderSettings());
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'providers' | 'mcp'>('providers');
+  const [mcpServers, setMcpServers] = useState<McpServerSnapshot[]>([]);
+  const [pinnedContext, setPinnedContext] = useState<PinnedContextItem[]>([]);
+
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [effort, setEffort] = useState<ModelEffort>('medium');
   const [agentMode, setAgentMode] = useState<AgentMode>('action');
@@ -390,19 +405,40 @@ export default function App() {
     [showNotice, refreshGitStatus]
   );
 
-  // Boot: load available workspaces (Home Quick Chat always starts fresh)
+  // Boot: load available workspaces, server AI defaults, and MCP servers
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (isTauriRuntime()) return;
-      const list = await listStarterWorkspaces();
-      if (mounted) {
-        setStarters(list);
+      const [list, mcpList, status] = await Promise.all([
+        listStarterWorkspaces(),
+        fetchMcpServers(),
+        fetchServerAiStatus().catch(() => null),
+      ]);
+      if (!mounted) return;
+      setStarters(list);
+      setMcpServers(mcpList);
+      if (status && !localStorage.getItem('aetheris.aiProviderSettings')) {
+        setAiSettings((prev) => ({
+          ...prev,
+          openaiBaseUrl: status.defaultOpenaiBaseUrl || prev.openaiBaseUrl,
+          openaiModel: status.defaultOpenaiModel || prev.openaiModel,
+        }));
       }
     })();
     return () => {
       mounted = false;
     };
+  }, []);
+
+  const handleUpdateAiSettings = useCallback((next: AiProviderSettings) => {
+    setAiSettings(next);
+    saveAiProviderSettings(next);
+  }, []);
+
+  const openSettingsModal = useCallback((tab: 'providers' | 'mcp' = 'providers') => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
   }, []);
 
   // Persist per-workspace conversation & agent settings automatically
@@ -511,6 +547,9 @@ export default function App() {
       } else if (mod && e.key.toLowerCase() === 's') {
         e.preventDefault();
         void handleSaveTab();
+      } else if (mod && e.key === ',') {
+        e.preventDefault();
+        setSettingsOpen((prev) => !prev);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -538,6 +577,7 @@ export default function App() {
       setWorkspaceCtx(nextCtx);
       setTerminalEntries([]);
       setTerminalCwd('.');
+      setPinnedContext([]);
       setActiveDiffPatchId(null);
       setActiveGitDiff(null);
       setGitStatus(null);
@@ -752,7 +792,8 @@ export default function App() {
       const { reply, createdProjects, sources, searchQueries } = await sendHomeChat(
         nextHistory
           .filter((m) => !m.error)
-          .map((m) => ({ role: m.role, content: m.content }))
+          .map((m) => ({ role: m.role, content: m.content })),
+        aiSettings
       );
 
       if (createdProjects.length > 0) {
@@ -1018,6 +1059,9 @@ export default function App() {
         agentMode: effectiveMode,
         autopilot: isAutopilotRun,
         history: priorHistory,
+        providerSettings: aiSettings,
+        pinnedContext,
+        terminalEntries,
         signal: abortController.signal,
         onEvent: (evt) => {
           if (evt.type === 'thought') {
@@ -1363,7 +1407,7 @@ export default function App() {
 
   const handleGitGenerateCommitMessage = async (): Promise<string> => {
     try {
-      return await generateGitCommitMessage(workspaceCtx);
+      return await generateGitCommitMessage(workspaceCtx, aiSettings);
     } catch (err) {
       showNotice('error', err instanceof Error ? err.message : 'Could not generate commit message');
       return '';
@@ -1466,6 +1510,59 @@ export default function App() {
 
   const allFilePaths = useMemo(() => flattenFilePaths(tree), [tree]);
 
+  const activeProviderLabel = useMemo(
+    () =>
+      aiSettings.provider === 'gemini'
+        ? `Gemini · ${aiSettings.geminiModel}`
+        : `OpenAI · ${aiSettings.openaiModel}`,
+    [aiSettings]
+  );
+
+  const handleAddPinnedContext = useCallback((item: PinnedContextItem) => {
+    setPinnedContext((prev) => {
+      if (prev.some((p) => p.id === item.id)) return prev;
+      return [...prev, item];
+    });
+  }, []);
+
+  const handleRemovePinnedContext = useCallback((id: string) => {
+    setPinnedContext((prev) => prev.filter((p) => p.id !== id));
+  }, []);
+
+  const handleApplyMcpPrompt = useCallback(
+    async (serverId: string, promptName: string): Promise<string | null> => {
+      try {
+        const resolved = await resolveMcpPromptTemplate({
+          serverId,
+          name: promptName,
+          workspaceId: workspaceCtx.source === 'starter' ? workspaceCtx.id : undefined,
+        });
+        for (const rec of resolved.recommendedResources) {
+          const id = `mcp:${rec.serverId}:${rec.uri}`;
+          setPinnedContext((prev) =>
+            prev.some((p) => p.id === id)
+              ? prev
+              : [
+                  ...prev,
+                  {
+                    id,
+                    kind: 'mcp-resource',
+                    label: rec.label,
+                    serverId: rec.serverId,
+                    uri: rec.uri,
+                  },
+                ]
+          );
+        }
+        return resolved.promptText;
+      } catch (err) {
+        showNotice('error', err instanceof Error ? err.message : 'Failed to resolve MCP prompt');
+        return null;
+      }
+    },
+    [workspaceCtx, showNotice]
+  );
+
   const closeTab = (pathToClose: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const nextTabs = tabs.filter((t) => t.path !== pathToClose);
@@ -1493,6 +1590,7 @@ export default function App() {
           onOpenLocalFolder={handleOpenLocalFolder}
           onSelectStarter={handleSelectStarter}
           onResetStarter={handleResetStarter}
+          onOpenSettings={() => openSettingsModal('providers')}
           onGoHome={() => {
             setHomeChatMessages([]);
             setView('home');
@@ -1537,6 +1635,8 @@ export default function App() {
             onOpenCreatedProject={(proj) => void handleOpenCreatedProject(proj)}
             onSendChat={handleSendHomeChat}
             onClearChat={() => setHomeChatMessages([])}
+            activeProviderLabel={activeProviderLabel}
+            onOpenSettings={() => openSettingsModal('providers')}
           />
         </main>
       ) : (
@@ -1805,6 +1905,10 @@ export default function App() {
               messages={agentMessages}
               activeFilePath={activeTabPath}
               workspaceFileCount={allFilePaths.length}
+              workspaceFiles={allFilePaths}
+              activeProviderLabel={activeProviderLabel}
+              mcpServers={mcpServers}
+              pinnedContext={pinnedContext}
               effort={effort}
               agentMode={agentMode}
               followAi={followAi}
@@ -1814,6 +1918,10 @@ export default function App() {
               onAgentModeChange={setAgentMode}
               onFollowAiChange={setFollowAi}
               onAutopilotChange={setAutopilot}
+              onAddPinnedContext={handleAddPinnedContext}
+              onRemovePinnedContext={handleRemovePinnedContext}
+              onApplyMcpPrompt={handleApplyMcpPrompt}
+              onOpenSettings={openSettingsModal}
               onSendPrompt={handleRunAgent}
               onCancelPrompt={handleCancelAgent}
               onOpenFile={(p) => void openFile(p)}
@@ -1866,6 +1974,17 @@ export default function App() {
         symbols={allSymbols}
         onClose={() => setPaletteOpen(false)}
         onSelectFile={openFile}
+      />
+
+      <SettingsModal
+        open={settingsOpen}
+        initialTab={settingsTab}
+        settings={aiSettings}
+        mcpServers={mcpServers}
+        activeWorkspaceId={workspaceCtx.source === 'starter' ? workspaceCtx.id : undefined}
+        onChangeSettings={handleUpdateAiSettings}
+        onMcpServersChange={setMcpServers}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

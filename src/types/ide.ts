@@ -170,3 +170,86 @@ export interface GitDiffPreview {
   modifiedContent: string;
 }
 
+export type AiProviderType = 'gemini' | 'openai-compatible';
+
+export interface AiProviderSettings {
+  provider: AiProviderType;
+  geminiModel: string;
+  openaiBaseUrl: string;
+  openaiModel: string;
+  enableWebSearch: boolean;
+}
+
+export interface ServerAiStatus {
+  geminiConfigured: boolean;
+  openaiCompatConfigured: boolean;
+  defaultOpenaiBaseUrl: string;
+  defaultOpenaiModel: string;
+  mcpEndpointPath: string;
+}
+
+export type McpTransportType = 'builtin' | 'stdio' | 'http';
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  transport: McpTransportType;
+  enabled: boolean;
+  description?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+}
+
+export interface McpToolInfo {
+  serverId: string;
+  serverName: string;
+  name: string;
+  qualifiedName: string;
+  description: string;
+  inputSchema?: Record<string, unknown>;
+}
+
+export interface McpResourceInfo {
+  serverId: string;
+  serverName: string;
+  uri: string;
+  name: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpPromptArgument {
+  name: string;
+  description?: string;
+  required?: boolean;
+}
+
+export interface McpPromptInfo {
+  serverId: string;
+  serverName: string;
+  name: string;
+  description?: string;
+  arguments?: McpPromptArgument[];
+}
+
+export interface McpServerSnapshot extends McpServerConfig {
+  status: 'connected' | 'disabled' | 'error';
+  error?: string;
+  protocolVersion?: string;
+  tools: McpToolInfo[];
+  resources: McpResourceInfo[];
+  prompts: McpPromptInfo[];
+}
+
+export interface PinnedContextItem {
+  id: string;
+  kind: 'file' | 'mcp-resource';
+  label: string;
+  path?: string;
+  serverId?: string;
+  uri?: string;
+  description?: string;
+}
+
+
